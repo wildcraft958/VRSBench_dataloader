@@ -2,7 +2,7 @@
 
 **Version:** 2.0.0  
 **Author:** Animesh Raj  
-**Date:** January 13, 2025
+**Date:** November 13, 2025
 
 Production-ready PyTorch DataLoader for the VRSBench (Vision-language for Remote Sensing) dataset with comprehensive logging, multi-task support, and robust error handling.
 
