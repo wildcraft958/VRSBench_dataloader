@@ -116,7 +116,9 @@ class VRSBenchConfig:
 
         # Create directories if they don't exist
         # exist_ok=True prevents errors if directories already exist
-        os.makedirs(self.LOG_DIR, exist_ok=True)
+        # Skip log directory creation if it's /dev/null (Colab workaround)
+        if self.LOG_DIR != "/dev/null":
+            os.makedirs(self.LOG_DIR, exist_ok=True)
         os.makedirs(self.CACHE_DIR, exist_ok=True)
 
 # ========================= Logging Setup =========================
@@ -174,26 +176,29 @@ class StructuredLogger:
 
         # File handler with rotation - prevents log files from growing too large
         # RotatingFileHandler automatically rotates when maxBytes is reached
-        log_path = Path(config.LOG_DIR) / config.LOG_FILE
-        file_handler = RotatingFileHandler(
-            log_path,
-            maxBytes=config.LOG_MAX_BYTES,  # Rotate at 10MB
-            backupCount=config.LOG_BACKUP_COUNT  # Keep 5 backup files
-        )
-        # File handler captures all levels (DEBUG+) for complete audit trail
-        file_handler.setLevel(logging.DEBUG)
-
-        if config.JSON_LOGS:
-            # Raw JSON format - each line is a complete JSON object
-            # This makes it easy to parse with tools like jq or log aggregation systems
-            file_format = logging.Formatter('%(message)s')
-        else:
-            # Plain text with function name and line number for debugging
-            file_format = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+        # Skip file handler if LOG_DIR is /dev/null (Colab workaround to prevent log bloat)
+        if config.LOG_DIR != "/dev/null":
+            log_path = Path(config.LOG_DIR) / config.LOG_FILE
+            file_handler = RotatingFileHandler(
+                log_path,
+                maxBytes=config.LOG_MAX_BYTES,  # Rotate at 10MB
+                backupCount=config.LOG_BACKUP_COUNT  # Keep 5 backup files
             )
-        file_handler.setFormatter(file_format)
-        self.logger.addHandler(file_handler)
+            # File handler captures all levels (DEBUG+) for complete audit trail
+            file_handler.setLevel(logging.DEBUG)
+
+            if config.JSON_LOGS:
+                # Raw JSON format - each line is a complete JSON object
+                # This makes it easy to parse with tools like jq or log aggregation systems
+                file_format = logging.Formatter('%(message)s')
+            else:
+                # Plain text with function name and line number for debugging
+                file_format = logging.Formatter(
+                    '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+                )
+            file_handler.setFormatter(file_format)
+            self.logger.addHandler(file_handler)
+        # If LOG_DIR is /dev/null, skip file handler entirely (prevents log bloat in Colab)
 
     def _format_json(self, level: str, message: str, **kwargs) -> str:
         """
@@ -1017,7 +1022,33 @@ class VRSBenchDataset(IterableDataset):
             # Extract and load
             extracted = self.ann_processor.extract_from_zip(zip_path)
             if extracted:
-                dataset = self.ann_processor.to_dataset(extracted[0])
+                # Try to find task-specific file (e.g., captioning.jsonl for captioning task)
+                selected_file = None
+                task_file_patterns = {
+                    'captioning': ['caption'],
+                    'classification': ['classif', 'class'],
+                    'vqa': ['vqa', 'qa'],
+                    'detection': ['detect', 'det'],
+                    'grounding': ['ground', 'grounding']
+                }
+                
+                # Look for task-specific file
+                if self.task in task_file_patterns:
+                    patterns = task_file_patterns[self.task]
+                    for pattern in patterns:
+                        for f in extracted:
+                            if pattern.lower() in os.path.basename(f).lower():
+                                selected_file = f
+                                break
+                        if selected_file:
+                            break
+                
+                # Fallback to first file if no task-specific file found
+                if not selected_file:
+                    selected_file = extracted[0]
+                
+                self.logger.info(f"Using annotation file: {os.path.basename(selected_file)}")
+                dataset = self.ann_processor.to_dataset(selected_file)
 
                 if isinstance(dataset, list):
                     for item in dataset:
@@ -1069,8 +1100,8 @@ class VRSBenchDataset(IterableDataset):
         skipped = 0
 
         for raw_item in self._load_annotations():
-            # Filter by split
-            if 'split' in raw_item and raw_item['split'] != self.split:
+            # Filter by split (skip if split is None, meaning load all)
+            if self.split is not None and 'split' in raw_item and raw_item['split'] != self.split:
                 continue
 
             # Expand multi-annotations if needed
