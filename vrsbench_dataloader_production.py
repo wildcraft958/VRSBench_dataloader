@@ -581,6 +581,7 @@ class AnnotationProcessor:
         Automatically detects file format:
         - JSONL: One JSON object per line
         - JSON: Single JSON object or array of objects
+        - Nested JSON: Dict containing arrays (e.g., {"annotations": [...]})
         """
         rows = []
         skipped = 0
@@ -598,15 +599,43 @@ class AnnotationProcessor:
                 
                 # Handle different JSON structures
                 if isinstance(data, list):
-                    # Array of objects
+                    # Array of objects - use directly
                     rows = data
                     if max_rows:
                         rows = rows[:max_rows]
                 elif isinstance(data, dict):
-                    # Single object - wrap in list
-                    rows = [data]
+                    # Check for nested arrays (common patterns)
+                    # Look for common keys that contain arrays of annotations
+                    nested_keys = ['annotations', 'data', 'items', 'records', 'samples', 'examples']
+                    found_nested = False
+                    
+                    for key in nested_keys:
+                        if key in data and isinstance(data[key], list):
+                            rows = data[key]
+                            self.logger.info(f"Found nested annotations in key '{key}': {len(rows)} items")
+                            found_nested = True
+                            if max_rows:
+                                rows = rows[:max_rows]
+                            break
+                    
+                    # If no nested array found, check if all values are lists
+                    if not found_nested:
+                        list_values = [v for v in data.values() if isinstance(v, list) and len(v) > 0]
+                        if list_values:
+                            # Use the longest list (most likely to be annotations)
+                            rows = max(list_values, key=len)
+                            self.logger.info(f"Found list in dict values: {len(rows)} items")
+                            if max_rows:
+                                rows = rows[:max_rows]
+                        else:
+                            # Single object - wrap in list
+                            rows = [data]
+                            self.logger.warning(f"JSON file contains single dict, not array. Wrapping in list.")
                 else:
                     raise ValueError(f"Unexpected JSON structure: {type(data)}")
+                
+                if not rows:
+                    raise RuntimeError(f"No valid records found in {jsonl_path}")
                 
                 df = pd.DataFrame(rows)
                 self.logger.info(f"Loaded {len(df)} annotation records from JSON file")
@@ -631,7 +660,24 @@ class AnnotationProcessor:
                     continue
 
                 try:
-                    rows.append(json.loads(line))
+                    parsed = json.loads(line)
+                    # Handle nested structures in JSONL too
+                    if isinstance(parsed, dict):
+                        # Check for nested arrays
+                        nested_keys = ['annotations', 'data', 'items', 'records', 'samples', 'examples']
+                        found_nested = False
+                        for key in nested_keys:
+                            if key in parsed and isinstance(parsed[key], list):
+                                # Expand nested array - add each item as a separate row
+                                for item in parsed[key]:
+                                    rows.append(item)
+                                found_nested = True
+                                break
+                        if not found_nested:
+                            # No nested array, add the dict itself
+                            rows.append(parsed)
+                    else:
+                        rows.append(parsed)
                 except json.JSONDecodeError as e:
                     skipped += 1
                     if skipped <= 5:  # Log first few errors
@@ -1053,12 +1099,51 @@ class VRSBenchDataset(IterableDataset):
 
         if self.annotations_jsonl is not None:
             self.logger.info(f"Loading from local JSONL: {self.annotations_jsonl}")
-            with open(self.annotations_jsonl, 'r', encoding='utf-8') as f:
-                for line in f:
-                    try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+            
+            # Check if it's JSONL or JSON
+            is_jsonl_file = self.annotations_jsonl.endswith('.jsonl')
+            
+            if is_jsonl_file:
+                # Standard JSONL - one object per line
+                with open(self.annotations_jsonl, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            parsed = json.loads(line)
+                            # Handle nested structures
+                            if isinstance(parsed, dict):
+                                nested_keys = ['annotations', 'data', 'items', 'records', 'samples', 'examples']
+                                found_nested = False
+                                for key in nested_keys:
+                                    if key in parsed and isinstance(parsed[key], list):
+                                        # Yield each item in nested array
+                                        for item in parsed[key]:
+                                            yield item
+                                        found_nested = True
+                                        break
+                                if not found_nested:
+                                    # No nested array, yield dict itself
+                                    yield parsed
+                            else:
+                                yield parsed
+                        except json.JSONDecodeError:
+                            continue
+            else:
+                # JSON file - use AnnotationProcessor to handle it properly
+                dataset = self.ann_processor.to_dataset(self.annotations_jsonl)
+                
+                # Handle different dataset types
+                if isinstance(dataset, list):
+                    for item in dataset:
+                        yield item
+                elif HAS_DATASETS and hasattr(dataset, '__iter__'):
+                    for item in dataset:
+                        yield dict(item) if isinstance(item, dict) else item
+                elif isinstance(dataset, pd.DataFrame):
+                    for _, row in dataset.iterrows():
+                        yield row.to_dict()
+                else:
+                    for item in dataset:
+                        yield item
             return
 
         if self.annotations_url is not None:
