@@ -575,12 +575,52 @@ class AnnotationProcessor:
             raise RuntimeError(f"Invalid zip file: {zip_path}") from e
 
     def load_jsonl(self, jsonl_path: str, max_rows: Optional[int] = None) -> pd.DataFrame:
-        """Load JSONL file into DataFrame with error handling"""
+        """
+        Load JSONL or JSON file into DataFrame with error handling.
+        
+        Automatically detects file format:
+        - JSONL: One JSON object per line
+        - JSON: Single JSON object or array of objects
+        """
         rows = []
         skipped = 0
 
         self.logger.info(f"Loading annotations from {jsonl_path}")
 
+        # Detect file format by reading first few bytes
+        is_jsonl = jsonl_path.endswith('.jsonl')
+        
+        if not is_jsonl:
+            # Try to load as regular JSON (single object or array)
+            try:
+                with open(jsonl_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Handle different JSON structures
+                if isinstance(data, list):
+                    # Array of objects
+                    rows = data
+                    if max_rows:
+                        rows = rows[:max_rows]
+                elif isinstance(data, dict):
+                    # Single object - wrap in list
+                    rows = [data]
+                else:
+                    raise ValueError(f"Unexpected JSON structure: {type(data)}")
+                
+                df = pd.DataFrame(rows)
+                self.logger.info(f"Loaded {len(df)} annotation records from JSON file")
+                self.metrics.increment("annotations_loaded", len(df))
+                return df
+                
+            except json.JSONDecodeError as e:
+                self.logger.warning(f"Failed to parse as JSON, trying JSONL format: {e}")
+                # Fall through to JSONL parsing
+            except Exception as e:
+                self.logger.error(f"Error loading JSON file: {e}")
+                raise
+
+        # Load as JSONL (one JSON object per line)
         with open(jsonl_path, 'r', encoding='utf-8') as f:
             for i, line in enumerate(f):
                 if max_rows and i >= max_rows:
@@ -600,6 +640,9 @@ class AnnotationProcessor:
         if skipped > 0:
             self.metrics.increment("jsonl_parse_errors", skipped)
             self.logger.warning(f"Skipped {skipped} malformed JSON lines")
+
+        if not rows:
+            raise RuntimeError(f"No valid records found in {jsonl_path}")
 
         df = pd.DataFrame(rows)
         self.logger.info(f"Loaded {len(df)} annotation records")
@@ -1029,6 +1072,10 @@ class VRSBenchDataset(IterableDataset):
             # Extract and load
             extracted = self.ann_processor.extract_from_zip(zip_path)
             if extracted:
+                # Separate JSONL and JSON files (prefer JSONL)
+                jsonl_files = [f for f in extracted if f.endswith('.jsonl')]
+                json_files = [f for f in extracted if f.endswith('.json') and not f.endswith('.jsonl')]
+                
                 # Try to find task-specific file (e.g., captioning.jsonl for captioning task)
                 selected_file = None
                 task_file_patterns = {
@@ -1039,28 +1086,56 @@ class VRSBenchDataset(IterableDataset):
                     'grounding': ['ground', 'grounding']
                 }
                 
-                # Look for task-specific file
+                # First, look for task-specific JSONL files (preferred)
                 if self.task in task_file_patterns:
                     patterns = task_file_patterns[self.task]
                     for pattern in patterns:
-                        for f in extracted:
+                        for f in jsonl_files:
                             if pattern.lower() in os.path.basename(f).lower():
                                 selected_file = f
                                 break
                         if selected_file:
                             break
                 
-                # Fallback to first file if no task-specific file found
+                # If no task-specific JSONL found, look for task-specific JSON
+                if not selected_file and self.task in task_file_patterns:
+                    patterns = task_file_patterns[self.task]
+                    for pattern in patterns:
+                        for f in json_files:
+                            if pattern.lower() in os.path.basename(f).lower():
+                                selected_file = f
+                                break
+                        if selected_file:
+                            break
+                
+                # Fallback: prefer first JSONL file, then first JSON file
                 if not selected_file:
-                    selected_file = extracted[0]
+                    if jsonl_files:
+                        selected_file = jsonl_files[0]
+                    elif json_files:
+                        selected_file = json_files[0]
+                    else:
+                        selected_file = extracted[0]
                 
                 self.logger.info(f"Using annotation file: {os.path.basename(selected_file)}")
                 dataset = self.ann_processor.to_dataset(selected_file)
 
+                # Handle different dataset types
                 if isinstance(dataset, list):
+                    # List of dicts - yield directly
                     for item in dataset:
                         yield item
+                elif HAS_DATASETS and hasattr(dataset, '__iter__'):
+                    # HuggingFace Dataset - iterate over it
+                    for item in dataset:
+                        # HuggingFace Dataset yields dicts directly
+                        yield dict(item) if isinstance(item, dict) else item
+                elif isinstance(dataset, pd.DataFrame):
+                    # DataFrame - convert to dict records
+                    for _, row in dataset.iterrows():
+                        yield row.to_dict()
                 else:
+                    # Fallback: try to iterate
                     for item in dataset:
                         yield item
             return
@@ -1122,7 +1197,14 @@ class VRSBenchDataset(IterableDataset):
                 if image_key is None:
                     skipped += 1
                     if skipped <= 10:
-                        self.logger.warning(f"Could not find image key in item: {list(item.keys())[:5]}")
+                        item_keys = list(item.keys())[:10]
+                        item_preview = {k: str(v)[:50] for k, v in list(item.items())[:3]}
+                        self.logger.warning(
+                            f"Could not find image key in item",
+                            item_keys=item_keys,
+                            item_preview=item_preview,
+                            item_type=type(item).__name__
+                        )
                     continue
 
                 image_ref = item.get(image_key)
