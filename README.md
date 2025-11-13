@@ -333,25 +333,6 @@ pip install datasets
    dataloader, metrics = create_vrsbench_dataloader(..., return_metrics=True)
    ```
 
-## Command-Line Testing
-
-```bash
-# Test with sample data
-python vrsbench_dataloader_production.py \
-    --images-dir ./data/images \
-    --annotations-jsonl ./data/annotations_val.jsonl \
-    --task classification \
-    --batch-size 4 \
-    --sample-size 20 \
-    --log-level DEBUG
-
-# Test VQA task
-python vrsbench_dataloader_production.py \
-    --images-dir ./data/images \
-    --annotations-jsonl ./data/vqa_annotations.jsonl \
-    --task vqa \
-    --batch-size 8
-```
 
 ## Advanced Usage
 

@@ -114,13 +114,20 @@ class StructuredLogger:
         # Remove existing handlers
         self.logger.handlers.clear()
 
-        # Console handler (human-readable)
+        # Console handler (human-readable or JSON)
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.INFO)
-        console_format = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
+        
+        if config.JSON_LOGS:
+            # For JSON logs: output raw JSON without additional formatting
+            console_format = logging.Formatter('%(message)s')
+        else:
+            # For plain text: human-readable with timestamp and level
+            console_format = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+        
         console_handler.setFormatter(console_format)
         self.logger.addHandler(console_handler)
 
@@ -750,9 +757,10 @@ class VRSBenchDataset(IterableDataset):
 
         # Try basename search
         basename = os.path.basename(image_ref)
-        for root, _, files in os.walk(self.images_dir):
-            if basename in files:
-                return os.path.join(root, basename)
+        if os.path.exists(self.images_dir):
+            for root, _, files in os.walk(self.images_dir):
+                if basename in files:
+                    return os.path.join(root, basename)
 
         return None
 
@@ -928,7 +936,15 @@ class VRSBenchDataset(IterableDataset):
                 if image_path is None:
                     skipped += 1
                     if skipped <= 10:
-                        self.logger.warning(f"Image not found: {image_ref}")
+                        # Enhanced error message with debugging info
+                        attempted_path = os.path.join(self.images_dir, str(image_ref)) if self.images_dir else str(image_ref)
+                        self.logger.warning(
+                            f"Image not found: {image_ref}",
+                            image_key=image_key,
+                            images_dir=self.images_dir,
+                            attempted_path=attempted_path,
+                            image_exists=os.path.exists(self.images_dir) if self.images_dir else False
+                        )
                     continue
 
                 # Load image
@@ -1137,75 +1153,3 @@ def get_task_targets(
     else:
         raise ValueError(f"Unsupported task: {task}")
 
-# ========================= Example Usage & Tests =========================
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="VRSBench DataLoader Production Test")
-    parser.add_argument("--images-dir", required=True, help="Path to images directory")
-    parser.add_argument("--annotations-jsonl", help="Path to annotations JSONL")
-    parser.add_argument("--task", default="classification", choices=["classification", "detection", "captioning", "vqa", "grounding"])
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--sample-size", type=int, default=10)
-    parser.add_argument("--log-level", default="INFO")
-
-    args = parser.parse_args()
-
-    # Configure
-    config = VRSBenchConfig()
-    config.LOG_LEVEL = args.log_level
-
-    print(f"\n{'='*60}")
-    print(f"VRSBench Production DataLoader Test")
-    print(f"{'='*60}")
-    print(f"Task: {args.task}")
-    print(f"Images: {args.images_dir}")
-    print(f"Annotations: {args.annotations_jsonl}")
-    print(f"{'='*60}\n")
-
-    # Create dataloader
-    try:
-        dataloader, metrics = create_vrsbench_dataloader(
-            images_dir=args.images_dir,
-            task=args.task,
-            annotations_jsonl=args.annotations_jsonl,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            sample_size=args.sample_size,
-            config=config,
-            return_metrics=True
-        )
-
-        print(f"✓ DataLoader created successfully\n")
-
-        # Test iteration
-        print(f"Testing {args.task} task...\n")
-
-        for batch_idx, (images, metas) in enumerate(dataloader):
-            print(f"Batch {batch_idx + 1}:")
-            print(f"  Images shape: {images.shape}")
-            print(f"  Metadata count: {len(metas)}")
-
-            # Get task-specific targets
-            targets = get_task_targets(metas, args.task)
-            print(f"  Targets: {targets[:3]}...")  # Show first 3
-
-            if batch_idx >= 2:  # Test first 3 batches
-                break
-
-        # Print metrics
-        print(f"\n{'='*60}")
-        print("Metrics Summary:")
-        print(f"{'='*60}")
-        summary = metrics.get_summary()
-        print(json.dumps(summary, indent=2))
-
-        print(f"\n✓ All tests passed!")
-
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
