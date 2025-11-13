@@ -1,0 +1,10 @@
+{"image_id": "sample_000", "image": "sample_000.jpg", "label": "urban", "split": "train"}
+{"image_id": "sample_001", "image": "sample_001.jpg", "label": "forest", "split": "train"}
+{"image_id": "sample_002", "image": "sample_002.jpg", "label": "water", "split": "train"}
+{"image_id": "sample_003", "image": "sample_003.jpg", "label": "agricultural", "split": "train"}
+{"image_id": "sample_004", "image": "sample_004.jpg", "label": "barren", "split": "train"}
+{"image_id": "sample_005", "image": "sample_005.jpg", "label": "urban", "split": "train"}
+{"image_id": "sample_006", "image": "sample_006.jpg", "label": "forest", "split": "train"}
+{"image_id": "sample_007", "image": "sample_007.jpg", "label": "water", "split": "train"}
+{"image_id": "sample_008", "image": "sample_008.jpg", "label": "agricultural", "split": "val"}
+{"image_id": "sample_009", "image": "sample_009.jpg", "label": "barren", "split": "val"}

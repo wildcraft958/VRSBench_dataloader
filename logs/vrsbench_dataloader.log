@@ -1,0 +1,20 @@
+{"timestamp": "2025-11-13T00:33:15.037951", "level": "INFO", "message": "Test log message", "logger": "test_logger"}
+{"timestamp": "2025-11-13T00:33:38.217121", "level": "INFO", "message": "Test info message", "logger": "test_logger"}
+{"timestamp": "2025-11-13T00:33:38.217253", "level": "WARNING", "message": "Test warning message", "logger": "test_logger"}
+{"timestamp": "2025-11-13T00:34:00.063778", "level": "INFO", "message": "Test log message", "logger": "test_logger"}
+{"timestamp": "2025-11-13T00:51:21.058472", "level": "INFO", "message": "Test log message", "logger": "test_logger"}
+{"timestamp": "2025-11-13T00:52:29.669867", "level": "INFO", "message": "Test log message", "logger": "test_logger"}
+{"timestamp": "2025-11-13T02:22:30.763072", "level": "INFO", "message": "Creating DataLoader for task=classification, split=None, batch_size=4", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:22:30.763328", "level": "INFO", "message": "Initializing VRSBench dataset for task: classification", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:22:30.763494", "level": "INFO", "message": "DataLoader created successfully", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:22:30.764312", "level": "INFO", "message": "Loading from local JSONL: ./test_data/annotations/classification.jsonl", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:22:30.764451", "level": "INFO", "message": "Dataset iteration complete: 0 yielded, 0 skipped", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:35:40.101952", "level": "WARNING", "message": "Image not found: sample_000.jpg", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:35:40.107047", "level": "WARNING", "message": "Image not found: sample_001.jpg", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:35:40.107180", "level": "WARNING", "message": "Image not found: sample_002.jpg", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:35:40.107238", "level": "WARNING", "message": "Image not found: sample_003.jpg", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:35:40.107289", "level": "WARNING", "message": "Image not found: sample_004.jpg", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:35:40.107338", "level": "WARNING", "message": "Image not found: sample_005.jpg", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:35:40.107385", "level": "WARNING", "message": "Image not found: sample_006.jpg", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:35:40.107432", "level": "WARNING", "message": "Image not found: sample_007.jpg", "logger": "DataLoaderFactory"}
+{"timestamp": "2025-11-13T02:35:40.108454", "level": "WARNING", "message": "Image not found: missing.jpg", "logger": "DataLoaderFactory"}
