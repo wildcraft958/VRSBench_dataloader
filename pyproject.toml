@@ -1,0 +1,88 @@
+[project]
+name = "vrsbench-dataloader"
+version = "2.0.0"
+description = "Production-ready PyTorch DataLoader for VRSBench (Vision-language for Remote Sensing) dataset"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Animesh Raj", email = ""}
+]
+keywords = ["pytorch", "dataloader", "remote-sensing", "satellite-imagery", "vision-language", "vrsbench"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+dependencies = [
+    # Core PyTorch ecosystem - required for tensor operations and data loading
+    "torch>=1.12.0",
+    "torchvision>=0.13.0",
+    
+    # Image processing - PIL for image loading and manipulation
+    "Pillow>=9.0.0",
+    
+    # Data handling - pandas for annotation processing
+    "pandas>=1.3.0",
+    
+    # Network operations - requests for downloading datasets from HuggingFace
+    "requests>=2.27.0",
+    
+    # Progress bars - tqdm for download progress visualization
+    "tqdm>=4.62.0",
+]
+
+[project.optional-dependencies]
+# Optional dependencies for enhanced functionality
+recommended = [
+    # HuggingFace datasets library - provides better performance and integration
+    # Falls back to pandas if not installed
+    "datasets>=2.0.0",
+]
+
+evaluation = [
+    # BERTScore - semantic similarity metric (better than BLEU for captioning tasks)
+    "bert-score>=0.3.13",
+    # ROUGE metrics - standard evaluation for text generation tasks
+    "rouge-score>=0.1.2",
+]
+
+dev = [
+    # Testing framework
+    "pytest>=7.0.0",
+    # Code formatting
+    "black>=22.0.0",
+    # Linting
+    "flake8>=4.0.0",
+    # Type checking
+    "mypy>=0.950",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/vrsbench-dataloader"
+Documentation = "https://github.com/yourusername/vrsbench-dataloader#readme"
+Repository = "https://github.com/yourusername/vrsbench-dataloader"
+Issues = "https://github.com/yourusername/vrsbench-dataloader/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "flake8>=4.0.0",
+    "mypy>=0.950",
+]
+

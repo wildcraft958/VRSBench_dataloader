@@ -18,8 +18,25 @@ Production-ready PyTorch DataLoader for the VRSBench (Vision-language for Remote
 
 ## Installation
 
+### Using uv (Recommended)
+
+[uv](https://github.com/astral-sh/uv) is a fast Python package installer written in Rust.
+
 ```bash
-pip install -r requirements.txt
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install dependencies
+uv pip install -e .
+
+# Or install with optional dependencies
+uv pip install -e ".[recommended]"
+```
+
+### Using pip
+
+```bash
+pip install -e .
 ```
 
 ### Requirements
@@ -33,6 +50,8 @@ pip install -r requirements.txt
 
 **Optional (recommended):**
 - datasets >= 2.0 (HuggingFace datasets library)
+
+All dependencies are defined in `pyproject.toml`.
 
 ## Quick Start
 

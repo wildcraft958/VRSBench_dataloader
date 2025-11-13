@@ -17,7 +17,16 @@ mkdir -p hf_cache
 # Install dependencies
 echo ""
 echo "Installing dependencies..."
-pip install -r requirements.txt
+
+# Check if uv is installed
+if command -v uv &> /dev/null; then
+    echo "Using uv for faster installation..."
+    uv pip install -e ".[recommended]"
+else
+    echo "uv not found. Installing with pip..."
+    echo "Consider installing uv for faster package management: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    pip install -e ".[recommended]"
+fi
 
 # Set HuggingFace token (optional)
 echo ""

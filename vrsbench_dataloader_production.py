@@ -41,7 +41,9 @@ import torch
 from torch.utils.data import IterableDataset, DataLoader
 from torchvision import transforms
 
-# Optional dependencies
+# Optional dependencies - HuggingFace datasets library
+# This library provides better performance for large datasets and seamless integration
+# with HuggingFace Hub. If not available, the code falls back to pandas-based processing.
 try:
     from datasets import load_dataset, Dataset
     HAS_DATASETS = True
@@ -54,75 +56,114 @@ except ImportError:
 
 @dataclass
 class VRSBenchConfig:
-    """Central configuration for VRSBench dataloader"""
+    """
+    Central configuration for VRSBench dataloader.
+    
+    This dataclass holds all configuration parameters in one place, making it easy to
+    customize behavior without modifying code. All settings have sensible defaults but
+    can be overridden via environment variables or direct instantiation.
+    """
 
     # Dataset URLs (direct HF access)
+    # These are the official HuggingFace dataset URLs for VRSBench
+    # Using /resolve/main/ ensures we get the actual files, not the git repository
     IMAGES_URL: str = "https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/images.zip"
     ANNOTATIONS_TRAIN_URL: str = "https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/Annotations_train.zip"
     ANNOTATIONS_VAL_URL: str = "https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/Annotations_val.zip"
 
     # Download settings
-    MAX_RETRIES: int = 5
-    BACKOFF_FACTOR: float = 1.5
-    CHUNK_SIZE: int = 16384  # 16KB chunks
-    TIMEOUT: int = 60
+    MAX_RETRIES: int = 5  # Number of retry attempts for failed downloads
+    BACKOFF_FACTOR: float = 1.5  # Exponential backoff multiplier (1.5x delay each retry)
+    CHUNK_SIZE: int = 16384  # 16KB chunks - balance between memory and network efficiency
+    TIMEOUT: int = 60  # Request timeout in seconds
 
     # Logging settings
+    # LOG_LEVEL can be set via environment variable for runtime control
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    LOG_DIR: str = "./logs"
-    LOG_FILE: str = "vrsbench_dataloader.log"
-    LOG_MAX_BYTES: int = 10 * 1024 * 1024  # 10MB
-    LOG_BACKUP_COUNT: int = 5
-    JSON_LOGS: bool = True
+    LOG_DIR: str = "./logs"  # Directory for log files
+    LOG_FILE: str = "vrsbench_dataloader.log"  # Main log file name
+    LOG_MAX_BYTES: int = 10 * 1024 * 1024  # 10MB - rotate logs when this size is reached
+    LOG_BACKUP_COUNT: int = 5  # Keep 5 backup log files (total ~50MB of logs)
+    JSON_LOGS: bool = True  # Use JSON format for machine-readable logs (better for parsing/monitoring)
 
     # Cache settings
-    CACHE_DIR: str = "./hf_cache"
-    VERIFY_CACHE: bool = True
+    CACHE_DIR: str = "./hf_cache"  # Directory for caching downloaded files
+    VERIFY_CACHE: bool = True  # Verify cached files are valid before using (prevents corruption issues)
 
     # Image processing
-    DEFAULT_IMAGE_SIZE: Tuple[int, int] = (256, 256)
-    REGION_PADDING: int = 10
+    DEFAULT_IMAGE_SIZE: Tuple[int, int] = (256, 256)  # Default resize size for images
+    REGION_PADDING: int = 10  # Pixels to pad around bounding boxes when extracting regions
 
-    # Performance
-    NUM_WORKERS: int = 4
-    BATCH_SIZE: int = 16
-    PIN_MEMORY: bool = True
-    PREFETCH_FACTOR: int = 2
+    # Performance settings
+    NUM_WORKERS: int = 4  # Number of parallel workers for data loading (0 = main process only)
+    BATCH_SIZE: int = 16  # Default batch size
+    PIN_MEMORY: bool = True  # Pin memory for faster GPU transfer (only useful with GPU)
+    PREFETCH_FACTOR: int = 2  # Number of batches to prefetch per worker (reduces idle time)
 
     # Task-specific settings
-    SUPPORTED_TASKS: List[str] = None
+    SUPPORTED_TASKS: List[str] = None  # Will be set in __post_init__
 
     def __post_init__(self):
+        """
+        Initialize default values and create necessary directories.
+        
+        Called automatically after dataclass instantiation to set defaults
+        that depend on other fields or require side effects (like creating directories).
+        """
         if self.SUPPORTED_TASKS is None:
+            # All supported vision-language tasks in VRSBench
             self.SUPPORTED_TASKS = ["classification", "detection", "captioning", "vqa", "grounding"]
 
-        # Create directories
+        # Create directories if they don't exist
+        # exist_ok=True prevents errors if directories already exist
         os.makedirs(self.LOG_DIR, exist_ok=True)
         os.makedirs(self.CACHE_DIR, exist_ok=True)
 
 # ========================= Logging Setup =========================
 
 class StructuredLogger:
-    """Production-ready structured logger with JSON support"""
+    """
+    Production-ready structured logger with JSON support.
+    
+    This logger provides two output formats:
+    1. JSON format: Machine-readable logs perfect for log aggregation systems (ELK, Splunk, etc.)
+    2. Plain text: Human-readable logs for development and debugging
+    
+    Features:
+    - Dual output: Console (INFO+) and file (DEBUG+) for different verbosity levels
+    - Log rotation: Prevents log files from growing unbounded
+    - Structured data: JSON logs include timestamps, levels, and custom fields
+    """
 
     def __init__(self, name: str, config: VRSBenchConfig):
+        """
+        Initialize structured logger with console and file handlers.
+        
+        Args:
+            name: Logger name (typically class/module name)
+            config: Configuration object with logging settings
+        """
         self.config = config
         self.logger = logging.getLogger(name)
         self.logger.setLevel(getattr(logging, config.LOG_LEVEL.upper()))
+        # Prevent propagation to root logger to avoid duplicate logs
         self.logger.propagate = False
 
-        # Remove existing handlers
+        # Remove existing handlers to avoid duplicates if logger is reused
         self.logger.handlers.clear()
 
-        # Console handler (human-readable or JSON)
+        # Console handler - outputs to stdout for immediate visibility
+        # Set to INFO level to avoid cluttering console with DEBUG messages
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.INFO)
         
         if config.JSON_LOGS:
             # For JSON logs: output raw JSON without additional formatting
+            # The JSON is already formatted by _format_json(), so we just pass it through
             console_format = logging.Formatter('%(message)s')
         else:
             # For plain text: human-readable with timestamp and level
+            # Useful for development and debugging
             console_format = logging.Formatter(
                 '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                 datefmt='%Y-%m-%d %H:%M:%S'
@@ -131,18 +172,23 @@ class StructuredLogger:
         console_handler.setFormatter(console_format)
         self.logger.addHandler(console_handler)
 
-        # File handler with rotation (JSON or plain)
+        # File handler with rotation - prevents log files from growing too large
+        # RotatingFileHandler automatically rotates when maxBytes is reached
         log_path = Path(config.LOG_DIR) / config.LOG_FILE
         file_handler = RotatingFileHandler(
             log_path,
-            maxBytes=config.LOG_MAX_BYTES,
-            backupCount=config.LOG_BACKUP_COUNT
+            maxBytes=config.LOG_MAX_BYTES,  # Rotate at 10MB
+            backupCount=config.LOG_BACKUP_COUNT  # Keep 5 backup files
         )
+        # File handler captures all levels (DEBUG+) for complete audit trail
         file_handler.setLevel(logging.DEBUG)
 
         if config.JSON_LOGS:
-            file_format = logging.Formatter('%(message)s')  # Raw JSON
+            # Raw JSON format - each line is a complete JSON object
+            # This makes it easy to parse with tools like jq or log aggregation systems
+            file_format = logging.Formatter('%(message)s')
         else:
+            # Plain text with function name and line number for debugging
             file_format = logging.Formatter(
                 '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
             )
@@ -150,13 +196,26 @@ class StructuredLogger:
         self.logger.addHandler(file_handler)
 
     def _format_json(self, level: str, message: str, **kwargs) -> str:
-        """Format log as JSON"""
+        """
+        Format log entry as JSON string.
+        
+        Creates a structured JSON log entry with standard fields plus any additional
+        context passed via kwargs. This makes logs machine-readable and queryable.
+        
+        Args:
+            level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+            message: Main log message
+            **kwargs: Additional fields to include in log (e.g., file_path, duration)
+        
+        Returns:
+            JSON string representation of log entry
+        """
         log_entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.utcnow().isoformat(),  # ISO 8601 format for easy parsing
             "level": level,
             "message": message,
-            "logger": self.logger.name,
-            **kwargs
+            "logger": self.logger.name,  # Identifies which component logged this
+            **kwargs  # Merge any additional context fields
         }
         return json.dumps(log_entry)
 
@@ -193,11 +252,26 @@ class StructuredLogger:
 # ========================= Metrics Collection =========================
 
 class MetricsCollector:
-    """Collect and report dataloader metrics"""
+    """
+    Collect and report dataloader performance metrics.
+    
+    This class tracks various metrics during data loading:
+    - Counters: Cache hits/misses, images loaded, errors encountered
+    - Timings: Download times, image load times, processing durations
+    - Errors: Categorized error counts for monitoring and debugging
+    
+    Metrics are useful for:
+    - Performance optimization (identifying bottlenecks)
+    - Monitoring production systems (error rates, cache efficiency)
+    - Debugging issues (which operations are slow/failing)
+    """
 
     def __init__(self):
+        # Counters for discrete events (cache hits, images loaded, etc.)
         self.metrics = defaultdict(int)
+        # Timing data for operations (allows computing mean/min/max)
         self.timings = defaultdict(list)
+        # Error counts by type (helps identify common failure modes)
         self.errors = defaultdict(int)
 
     def record_time(self, operation: str, duration: float):
@@ -236,46 +310,90 @@ class MetricsCollector:
 # ========================= Download Utilities =========================
 
 class DownloadManager:
-    """Manages robust file downloads with caching and verification"""
+    """
+    Manages robust file downloads with caching and verification.
+    
+    This class handles downloading datasets from HuggingFace with:
+    - Automatic retries with exponential backoff (handles network failures)
+    - File caching (avoids re-downloading on subsequent runs)
+    - Integrity verification (ensures files aren't corrupted)
+    - Progress bars (visual feedback during long downloads)
+    - Rate limit handling (detects and handles HTTP 429 errors)
+    - HuggingFace authentication (uses tokens to avoid rate limits)
+    """
 
     def __init__(self, config: VRSBenchConfig, logger: StructuredLogger, metrics: MetricsCollector):
+        """
+        Initialize download manager with configuration and dependencies.
+        
+        Args:
+            config: Configuration with download settings (retries, timeouts, etc.)
+            logger: Logger for tracking download progress and errors
+            metrics: Metrics collector for tracking cache hits/misses and download times
+        """
         self.config = config
         self.logger = logger
         self.metrics = metrics
 
     def _get_headers(self) -> Dict[str, str]:
-        """Get headers with HF authentication if available"""
+        """
+        Get HTTP headers with HuggingFace authentication if available.
+        
+        HuggingFace allows anonymous downloads but rate-limits them. Providing a token
+        (free from https://huggingface.co/settings/tokens) increases rate limits significantly.
+        
+        Returns:
+            Dictionary of HTTP headers including authentication if token is available
+        """
+        # Check for token in environment variables (supports both common variable names)
         token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
         headers = {"User-Agent": "vrsbench-production-loader/2.0"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
             self.logger.debug("Using HuggingFace authentication token")
         else:
+            # Warn but don't fail - downloads will still work, just may be slower
             self.logger.warning("No HF token found. Downloads may be rate-limited. Set HUGGINGFACE_HUB_TOKEN env var.")
         return headers
 
     def _verify_file(self, path: str, expected_size: Optional[int] = None) -> bool:
-        """Verify downloaded file integrity"""
+        """
+        Verify downloaded file integrity before using cached files.
+        
+        This prevents using corrupted or incomplete downloads. Checks:
+        1. File exists
+        2. File size is reasonable (not suspiciously small)
+        3. File size matches expected size (if provided)
+        4. Zip files are valid (can be opened and read)
+        
+        Args:
+            path: Path to file to verify
+            expected_size: Expected file size in bytes (optional, for validation)
+        
+        Returns:
+            True if file is valid, False otherwise
+        """
         if not os.path.exists(path):
             return False
 
         file_size = os.path.getsize(path)
 
-        # Check minimum size
-        if file_size < 1024:  # Less than 1KB is suspicious
+        # Check minimum size - files smaller than 1KB are likely error pages or empty
+        if file_size < 1024:
             self.logger.warning(f"File {path} is suspiciously small: {file_size} bytes")
             return False
 
-        # Check expected size if provided
+        # Check expected size if provided - allows detecting incomplete downloads
+        # Tolerance of 1KB accounts for minor variations
         if expected_size and abs(file_size - expected_size) > 1024:
             self.logger.warning(f"File size mismatch: expected ~{expected_size}, got {file_size}")
             return False
 
-        # Check if it's a zip file
+        # Check if it's a zip file - try to open it to verify it's not corrupted
         if path.endswith('.zip'):
             try:
                 with zipfile.ZipFile(path, 'r') as zf:
-                    zf.namelist()
+                    zf.namelist()  # Try to read file list - will fail if corrupted
                 return True
             except zipfile.BadZipFile:
                 self.logger.error(f"Corrupted zip file: {path}")
@@ -285,35 +403,46 @@ class DownloadManager:
 
     def download_with_retries(self, url: str, output_path: str, force: bool = False) -> str:
         """
-        Download file with automatic retries, progress bar, and caching
+        Download file with automatic retries, progress bar, and caching.
+        
+        This is the main download method that orchestrates the entire download process:
+        1. Checks cache first (avoids unnecessary downloads)
+        2. Downloads with progress bar (visual feedback)
+        3. Verifies file integrity (ensures download succeeded)
+        4. Retries on failure with exponential backoff (handles transient errors)
+        5. Handles rate limiting (detects HTTP 429 and waits)
 
         Args:
-            url: Source URL
-            output_path: Destination path
-            force: Force re-download even if cached
+            url: Source URL to download from
+            output_path: Local path where file should be saved
+            force: If True, re-download even if cached file exists
 
         Returns:
-            Path to downloaded file
+            Path to downloaded file (same as output_path)
 
         Raises:
-            RuntimeError: If download fails after all retries
+            RuntimeError: If download fails after all retry attempts
         """
         start_time = time.time()
 
-        # Check cache
+        # Check cache first - avoids re-downloading if file already exists
         if not force and os.path.exists(output_path):
             if self.config.VERIFY_CACHE and self._verify_file(output_path):
+                # Cache hit with verification - file exists and is valid
                 self.logger.info(f"Using cached file: {output_path}")
                 self.metrics.increment("cache_hits")
                 return output_path
             elif not self.config.VERIFY_CACHE:
+                # Cache hit without verification - faster but less safe
                 self.logger.info(f"Using cached file (unverified): {output_path}")
                 self.metrics.increment("cache_hits")
                 return output_path
             else:
+                # Cached file exists but failed verification - delete and re-download
                 self.logger.warning(f"Cached file invalid, re-downloading: {output_path}")
                 os.remove(output_path)
 
+        # Cache miss - need to download
         self.metrics.increment("cache_misses")
 
         # Download with retries
@@ -728,40 +857,68 @@ class VRSBenchDataset(IterableDataset):
         self.task_processor = TaskProcessor()
 
     def _find_image_path(self, image_ref: Any) -> Optional[str]:
-        """Robustly find image file path from annotation reference"""
+        """
+        Robustly find image file path from annotation reference.
+        
+        This method handles various annotation formats and image reference styles:
+        1. String paths (absolute or relative)
+        2. Lists/tuples (takes first element)
+        3. Dictionaries (extracts path from common keys)
+        4. Multiple search strategies (absolute, relative, basename search)
+        
+        The search order is:
+        1. Absolute path check (if image_ref is already absolute)
+        2. Relative to images_dir (most common case)
+        3. Basename search (finds file anywhere in images_dir tree)
+        
+        This flexibility handles different annotation formats and directory structures.
+        
+        Args:
+            image_ref: Image reference from annotation (can be str, list, dict, etc.)
+        
+        Returns:
+            Absolute path to image file if found, None otherwise
+        """
         if image_ref is None:
             return None
 
-        # Handle various formats
+        # Handle various formats - annotations may store image refs differently
         if isinstance(image_ref, (list, tuple)):
+            # If it's a list/tuple, take the first element (most common case)
             image_ref = image_ref[0]
 
         if isinstance(image_ref, dict):
+            # If it's a dict, try common keys that might contain the path
             for key in ['path', 'filename', 'file_name', 'id', 'image']:
                 if key in image_ref:
                     image_ref = image_ref[key]
                     break
             else:
+                # No recognized key found, convert dict to string (fallback)
                 image_ref = str(image_ref)
 
         image_ref = str(image_ref)
 
-        # Try absolute path
+        # Strategy 1: Try absolute path (if annotation already has full path)
         if os.path.isabs(image_ref) and os.path.exists(image_ref):
             return image_ref
 
-        # Try relative to images_dir
+        # Strategy 2: Try relative to images_dir (most common case)
+        # This handles cases where annotations have relative paths like "image_001.jpg"
         candidate = os.path.join(self.images_dir, image_ref)
         if os.path.exists(candidate):
             return candidate
 
-        # Try basename search
+        # Strategy 3: Try basename search (finds file anywhere in images_dir tree)
+        # This handles cases where images are in subdirectories but annotation only has filename
         basename = os.path.basename(image_ref)
         if os.path.exists(self.images_dir):
+            # Walk the directory tree to find the file
             for root, _, files in os.walk(self.images_dir):
                 if basename in files:
                     return os.path.join(root, basename)
 
+        # All strategies failed - image not found
         return None
 
     def _normalize_bbox(self, bbox: List[float], img_width: int, img_height: int) -> List[float]:
