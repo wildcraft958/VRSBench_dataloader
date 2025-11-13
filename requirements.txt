@@ -12,6 +12,10 @@ tqdm>=4.62.0
 # Optional (recommended for better performance)
 datasets>=2.0.0  # HuggingFace datasets library
 
+# Evaluation metrics
+bert-score>=0.3.13  # BERTScore for semantic similarity (better than BLEU for captioning)
+rouge-score>=0.1.2  # ROUGE metrics
+
 # Development dependencies (optional)
 pytest>=7.0.0
 black>=22.0.0

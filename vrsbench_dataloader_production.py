@@ -512,6 +512,59 @@ class TaskProcessor:
     """Process annotations for different tasks"""
 
     @staticmethod
+    def normalize_bbox(bbox: List[float], image_width: int, image_height: int) -> List[float]:
+        """
+        Normalize bounding box coordinates to pixel values if needed.
+        
+        Handles:
+        - Normalized coords [0-1] -> pixel coords
+        - Corner format [x1, y1, x2, y2] -> [x, y, w, h]
+        
+        Args:
+            bbox: Bounding box [x, y, w, h] or [x1, y1, x2, y2]
+            image_width: Image width in pixels
+            image_height: Image height in pixels
+            
+        Returns:
+            [x, y, w, h] in pixel coordinates
+        """
+        if not bbox or len(bbox) < 4:
+            return bbox
+        
+        x1, y1, x2_or_w, y2_or_h = bbox[:4]
+        
+        # Detect normalized coordinates (all values <= 1)
+        if all(0 <= val <= 1 for val in [x1, y1, x2_or_w, y2_or_h]):
+            # Check if it's corner format [x1, y1, x2, y2] or [x, y, w, h]
+            # If x2 > x1 and values look like corners, treat as corners
+            if x2_or_w > x1 and y2_or_h > y1 and x2_or_w <= 1 and y2_or_h <= 1:
+                # Corner format normalized -> convert to pixel coords
+                x = int(x1 * image_width)
+                y = int(y1 * image_height)
+                w = int((x2_or_w - x1) * image_width)
+                h = int((y2_or_h - y1) * image_height)
+            else:
+                # [x, y, w, h] normalized -> convert to pixels
+                x = int(x1 * image_width)
+                y = int(y1 * image_height)
+                w = int(x2_or_w * image_width)
+                h = int(y2_or_h * image_height)
+            return [x, y, w, h]
+        
+        # Already in pixel coordinates
+        # Check if corner format [x1, y1, x2, y2] in pixels
+        if x2_or_w > x1 and y2_or_h > y1 and x2_or_w <= image_width and y2_or_h <= image_height:
+            # Likely corner format -> convert to [x, y, w, h]
+            x = int(x1)
+            y = int(y1)
+            w = int(x2_or_w - x1)
+            h = int(y2_or_h - y1)
+            return [x, y, w, h]
+        
+        # Already [x, y, w, h] in pixels
+        return [int(x1), int(y1), int(x2_or_w), int(y2_or_h)]
+
+    @staticmethod
     def extract_classification_labels(metas: List[Dict[str, Any]], label_key: Optional[str] = None) -> List[Any]:
         """Extract classification labels"""
         if not metas:
@@ -583,8 +636,10 @@ class TaskProcessor:
         if not bbox or len(bbox) < 4:
             return image
 
-        x, y, w, h = bbox[:4]
+        # Normalize bbox to [x, y, w, h] in pixels
         img_w, img_h = image.size
+        normalized_bbox = TaskProcessor.normalize_bbox(bbox, img_w, img_h)
+        x, y, w, h = normalized_bbox[:4]
 
         x1 = max(0, int(x - padding))
         y1 = max(0, int(y - padding))
@@ -700,6 +755,50 @@ class VRSBenchDataset(IterableDataset):
                 return os.path.join(root, basename)
 
         return None
+
+    def _normalize_bbox(self, bbox: List[float], img_width: int, img_height: int) -> List[float]:
+        """
+        Normalize bbox to [x, y, w, h] in pixels.
+        Handles:
+        - Normalized coords (0..1) -> convert to pixels
+        - Corner format [x1,y1,x2,y2] -> convert to [x,y,w,h]
+        - Already pixel coords [x,y,w,h] -> return as-is
+        """
+        if not bbox or len(bbox) < 4:
+            return bbox
+
+        x1, y1, x2_or_w, y2_or_h = bbox[:4]
+
+        # Detect if normalized (all values <= 1.0)
+        if all(v <= 1.0 for v in [x1, y1, x2_or_w, y2_or_h]):
+            # Normalized coords - could be [x1,y1,x2,y2] or [x,y,w,h]
+            # Check if x2_or_w + x1 > 1.0 (indicating it's width, not x2)
+            if x2_or_w < x1 or y2_or_h < y1:
+                # It's [x,y,w,h] in normalized form
+                x = int(x1 * img_width)
+                y = int(y1 * img_height)
+                w = int(x2_or_w * img_width)
+                h = int(y2_or_h * img_height)
+            else:
+                # It's [x1,y1,x2,y2] in normalized form
+                x = int(x1 * img_width)
+                y = int(y1 * img_height)
+                w = int((x2_or_w - x1) * img_width)
+                h = int((y2_or_h - y1) * img_height)
+            return [x, y, w, h]
+
+        # Check if it's corner format [x1,y1,x2,y2] in pixels
+        # (x2 > x1 and x2 > img_width/2 suggests corner format)
+        if x2_or_w > x1 and y2_or_h > y1 and x2_or_w > x1 + 10:
+            # Convert corner to xywh
+            x = int(x1)
+            y = int(y1)
+            w = int(x2_or_w - x1)
+            h = int(y2_or_h - y1)
+            return [x, y, w, h]
+
+        # Already in [x,y,w,h] pixel format
+        return [int(x1), int(y1), int(x2_or_w), int(y2_or_h)]
 
     def _guess_image_key(self, item: Dict[str, Any]) -> Optional[str]:
         """Guess image key from annotation dict"""
@@ -837,6 +936,17 @@ class VRSBenchDataset(IterableDataset):
                     start_time = time.time()
                     with Image.open(image_path) as img:
                         img = img.convert('RGB')
+                        img_width, img_height = img.size
+
+                        # Normalize bboxes if needed (convert normalized coords to pixels)
+                        if 'bbox' in item:
+                            item['bbox'] = self._normalize_bbox(item['bbox'], img_width, img_height)
+                        if 'bboxes' in item:
+                            item['bboxes'] = [self._normalize_bbox(b, img_width, img_height) for b in item['bboxes']]
+                        if 'objects' in item and isinstance(item['objects'], list):
+                            for obj in item['objects']:
+                                if 'bbox' in obj:
+                                    obj['bbox'] = self._normalize_bbox(obj['bbox'], img_width, img_height)
 
                         # Extract region if needed
                         if self.region_based and 'bbox' in item:
@@ -852,9 +962,16 @@ class VRSBenchDataset(IterableDataset):
                         else:
                             img_tensor = transforms.ToTensor()(img)
 
+                    # Add resolved image path to metadata for downstream use
+                    item['_image_path'] = image_path
+                    item['_image_size'] = (img_width, img_height)
+
                     load_time = time.time() - start_time
                     self.metrics.record_time("image_load", load_time)
                     self.metrics.increment("images_loaded")
+
+                    # Inject resolved image path into metadata for downstream use
+                    item['_image_path'] = image_path
 
                 except Exception as e:
                     self.metrics.record_error("image_load_error")
