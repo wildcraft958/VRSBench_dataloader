@@ -918,8 +918,15 @@ class VRSBenchDataset(IterableDataset):
         # This handles cases where images are in subdirectories but annotation only has filename
         basename = os.path.basename(image_ref)
         if os.path.exists(self.images_dir):
-            # Walk the directory tree to find the file
-            for root, _, files in os.walk(self.images_dir):
+            # First check if basename exists directly in images_dir
+            direct_path = os.path.join(self.images_dir, basename)
+            if os.path.exists(direct_path):
+                return direct_path
+            
+            # Walk the directory tree to find the file (skip hidden dirs and __MACOSX)
+            for root, dirs, files in os.walk(self.images_dir):
+                # Skip hidden directories and macOS metadata
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__MACOSX']
                 if basename in files:
                     return os.path.join(root, basename)
 
@@ -1191,6 +1198,63 @@ class VRSBenchDataset(IterableDataset):
         if skipped > 10:
             self.logger.warning(f"Total skipped items: {skipped}")
 
+# ========================= Helper Functions =========================
+
+def _detect_image_directory(base_dir: str) -> str:
+    """
+    Automatically detect the actual directory containing images after extraction.
+    
+    When a zip file is extracted, images might be in:
+    1. The base directory directly
+    2. A single subdirectory (e.g., Images_val.zip -> Images_val/)
+    3. Multiple subdirectories (use the one with most images)
+    
+    Args:
+        base_dir: Base directory where zip was extracted
+        
+    Returns:
+        Path to directory containing the most images
+    """
+    if not os.path.exists(base_dir):
+        return base_dir
+    
+    image_extensions = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG', '.bmp', '.BMP')
+    
+    # Count images in base directory
+    base_images = [f for f in os.listdir(base_dir) 
+                   if f.endswith(image_extensions) and os.path.isfile(os.path.join(base_dir, f))]
+    base_count = len(base_images)
+    
+    # Find subdirectories (excluding hidden and system dirs)
+    subdirs = [d for d in os.listdir(base_dir) 
+               if os.path.isdir(os.path.join(base_dir, d)) 
+               and not d.startswith('.') 
+               and d != '__MACOSX']
+    
+    if not subdirs:
+        # No subdirectories, images are in base
+        return base_dir
+    
+    # Count images in each subdirectory
+    best_dir = base_dir
+    best_count = base_count
+    
+    for subdir in subdirs:
+        subdir_path = os.path.join(base_dir, subdir)
+        try:
+            subdir_images = [f for f in os.listdir(subdir_path)
+                           if f.endswith(image_extensions) and os.path.isfile(os.path.join(subdir_path, f))]
+            subdir_count = len(subdir_images)
+            
+            if subdir_count > best_count:
+                best_dir = subdir_path
+                best_count = subdir_count
+        except (OSError, PermissionError):
+            # Skip directories we can't read
+            continue
+    
+    return best_dir
+
 # ========================= DataLoader Factory =========================
 
 def create_vrsbench_dataloader(
@@ -1261,6 +1325,13 @@ def create_vrsbench_dataloader(
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(images_dir)
         logger.info(f"Images extracted to {images_dir}")
+        
+        # Auto-detect actual image directory after extraction
+        # Images might be in a subdirectory (e.g., Images_val.zip extracts to Images_val/)
+        actual_images_dir = _detect_image_directory(images_dir)
+        if actual_images_dir != images_dir:
+            logger.info(f"Images found in subdirectory: {actual_images_dir}")
+            images_dir = actual_images_dir
 
     # Default transform
     if transform is None:
