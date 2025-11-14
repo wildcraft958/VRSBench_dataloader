@@ -5,6 +5,14 @@
 
 Production-ready PyTorch DataLoader for the VRSBench (Vision-language for Remote Sensing) dataset. Built for enterprise workloads with hardened reliability, comprehensive logging, and multi-task abstractions that eliminate boilerplate across classification, detection, captioning, VQA, and visual grounding tasks.
 
+## 🚀 Quick Setup Files
+
+This repository includes utility files for easy setup:
+
+- **`jupyter_setup.py`** - Zero-friction Jupyter setup (works in Colab, JupyterLab, local Jupyter)
+- **`setup_vrsbench.py`** - Reusable setup utility for any environment (Python scripts, notebooks, etc.)
+- **`setup.sh`** - Bash script for local installation
+
 **Architecture**: The loader is built around a high-level API that automatically handles HuggingFace streaming datasets, image downloads, and data preparation. All functionality is consolidated under `prepare_vrsbench_dataset()` and `create_dataloader_from_prepared()`. The standard `create_vrsbench_dataloader()` function is now a convenience wrapper around these high-level functions.
 
 ## Why This Loader Exists
@@ -54,29 +62,56 @@ pip install -e .
 
 The VRSBench DataLoader works seamlessly in Google Colab notebooks. Here's how to set it up:
 
-### Option 1: Install from GitHub (Recommended)
+### Option 1: Zero-Friction Setup (Recommended)
+
+**Easiest method** - Works in any Jupyter environment (Colab, JupyterLab, local Jupyter):
+
+```python
+# Method 1: Upload jupyter_setup.py and run
+exec(open('jupyter_setup.py').read())
+
+# Method 2: Use the setup function (auto-detects environment)
+from setup_vrsbench import setup_for_notebook
+
+prepare_vrsbench_dataset, create_dataloader_from_prepared, get_task_targets = setup_for_notebook(
+    repo_url="https://github.com/wildcraft958/VRSBench_dataloader",  # Optional: auto-detects if None
+    run_test=True  # Optional: runs a quick smoke test
+)
+```
+
+**What it does automatically:**
+- Auto-detects your Jupyter environment (Colab, JupyterLab, local Jupyter)
+- Clones repository from GitHub (if needed)
+- Installs all dependencies
+- Adds to Python path
+- Imports all functions
+- Runs optional smoke test
+
+### Option 2: Manual Setup
 
 ```python
 # Install dependencies
 !pip install -q torch torchvision pillow pandas requests tqdm datasets
 
-# Clone or upload the dataloader module
-# Option A: Clone from GitHub (if your repo is public)
+# Clone repository
 !git clone https://github.com/yourusername/VRSBench_dataloader.git /content/vrsbench_dataloader
 import sys
 sys.path.insert(0, '/content/vrsbench_dataloader')
 
-# Option B: Upload the module file directly
-from google.colab import files
-uploaded = files.upload()  # Upload vrsbench_dataloader_production.py
+# Import functions
+from vrsbench_dataloader_production import (
+    prepare_vrsbench_dataset,
+    create_dataloader_from_prepared,
+    create_vrsbench_dataloader,
+    get_task_targets
+)
 ```
 
-### Option 2: Direct Import (If Module is in Colab)
+### Option 3: Direct Upload
 
-If you've uploaded `vrsbench_dataloader_production.py` to Colab:
+If you've uploaded `vrsbench_dataloader_production.py` directly to Colab:
 
 ```python
-# Import directly
 from vrsbench_dataloader_production import (
     prepare_vrsbench_dataset,
     create_dataloader_from_prepared,
@@ -172,6 +207,47 @@ for images, metas in dataloader:
    ```
 
 ## Quick Start: Your First 5 Minutes
+
+### For Jupyter Notebook Users (Colab, JupyterLab, Local Jupyter)
+
+**Fastest way to get started:**
+
+1. Upload `jupyter_setup.py` to your notebook
+2. Run: `exec(open('jupyter_setup.py').read())`
+3. Update `REPO_URL` in the file if needed (defaults to wildcraft958/VRSBench_dataloader)
+4. Run the cell - everything is set up automatically!
+
+Or use the setup function (auto-detects environment):
+```python
+from setup_vrsbench import setup_for_notebook
+
+# Auto-detects Colab, JupyterLab, or local Jupyter
+prepare_vrsbench_dataset, create_dataloader_from_prepared, get_task_targets = setup_for_notebook(
+    repo_url="https://github.com/wildcraft958/VRSBench_dataloader"  # Optional
+)
+```
+
+### For Local Users
+
+After cloning the repository locally:
+
+```python
+# Option 1: Use the setup utility
+from setup_vrsbench import setup_vrsbench_loader
+
+prepare_vrsbench_dataset, create_dataloader_from_prepared, get_task_targets = setup_vrsbench_loader(
+    repo_url="https://github.com/yourusername/VRSBench_dataloader",  # Optional if already cloned
+    auto_install_deps=True,
+    run_smoke_test=False
+)
+
+# Option 2: Direct import (if already in the repo directory)
+from vrsbench_dataloader_production import (
+    prepare_vrsbench_dataset,
+    create_dataloader_from_prepared,
+    get_task_targets
+)
+```
 
 ### Simplified Workflow for All Tasks
 
