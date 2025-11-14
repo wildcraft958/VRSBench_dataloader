@@ -7,7 +7,7 @@ captioning, VQA, grounding).
 
 Author: Animesh Raj
 Date: 2025-01-13
-Version: 2.0.0
+Version: 3.0.0
 
 Features:
 - Structured JSON logging with rotation
@@ -15,7 +15,8 @@ Features:
 - Region-level extraction for high-res satellite imagery
 - Automatic retry with exponential backoff
 - Metrics collection (load times, error rates, cache hits)
-- HuggingFace fallback strategies
+- HuggingFace streaming dataset integration (primary workflow)
+- JSONL file support (fallback for custom datasets)
 - Production-ready error handling
 """
 
@@ -25,10 +26,8 @@ import sys
 import time
 import json
 import zipfile
-import hashlib
-import warnings
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from collections import defaultdict
 from datetime import datetime
 import logging
@@ -542,6 +541,50 @@ class AnnotationProcessor:
         self.config = config
         self.logger = logger
         self.metrics = metrics
+    
+    def _extract_nested_annotations(self, data: Dict[str, Any], nested_keys: List[str]) -> Tuple[Optional[List], bool]:
+        """
+        Extract annotations from nested structures.
+        
+        Returns:
+            Tuple of (extracted_rows, found_nested)
+        """
+        for key in nested_keys:
+            if key in data and isinstance(data[key], list) and len(data[key]) > 0:
+                nested_list = data[key]
+                sample_item = nested_list[0] if nested_list else {}
+                nested_has_image = isinstance(sample_item, dict) and (
+                    'image' in sample_item or 'image_id' in sample_item or 'image_name' in sample_item
+                )
+                
+                if nested_has_image:
+                    return nested_list, True
+                else:
+                    # Merge with parent context
+                    parent_context = {k: v for k, v in data.items() if k != key}
+                    rows = []
+                    for item in nested_list:
+                        if isinstance(item, dict):
+                            rows.append({**parent_context, **item})
+                        else:
+                            rows.append(item)
+                    return rows, True
+        return None, False
+    
+    def _iterate_dataset(self, dataset: Any) -> Iterator[Dict[str, Any]]:
+        """Consolidated dataset iteration logic"""
+        if isinstance(dataset, list):
+            for item in dataset:
+                yield item
+        elif HAS_DATASETS and hasattr(dataset, '__iter__'):
+            for item in dataset:
+                yield dict(item) if isinstance(item, dict) else item
+        elif isinstance(dataset, pd.DataFrame):
+            for _, row in dataset.iterrows():
+                yield row.to_dict()
+        else:
+            for item in dataset:
+                yield item
 
     def extract_from_zip(self, zip_path: str, extract_to: Optional[str] = None) -> List[str]:
         """Extract annotation files from zip"""
@@ -604,29 +647,65 @@ class AnnotationProcessor:
                     if max_rows:
                         rows = rows[:max_rows]
                 elif isinstance(data, dict):
-                    # Check for nested arrays (common patterns)
-                    # Look for common keys that contain arrays of annotations
-                    nested_keys = ['annotations', 'data', 'items', 'records', 'samples', 'examples']
-                    found_nested = False
+                    # Check for task-specific keys first (caption, image, etc.)
+                    # If the dict itself has caption/image, it's likely a single annotation
+                    has_caption = 'caption' in data or 'captions' in data
+                    has_image = 'image' in data or 'image_id' in data or 'image_name' in data
                     
-                    for key in nested_keys:
-                        if key in data and isinstance(data[key], list):
-                            rows = data[key]
-                            self.logger.info(f"Found nested annotations in key '{key}': {len(rows)} items")
-                            found_nested = True
+                    # For captioning: if top-level has caption, prefer it over nested arrays
+                    # (nested arrays like qa_pairs are for VQA, not captioning)
+                    if has_caption and has_image:
+                        # This is a complete annotation - use as-is
+                        rows = [data]
+                        self.logger.info(f"Found complete annotation dict with caption and image")
+                        found_nested = True  # Skip nested array extraction
+                    else:
+                        # Check for nested arrays (common patterns)
+                        # Look for common keys that contain arrays of annotations
+                        nested_keys = ['annotations', 'data', 'items', 'records', 'samples', 'examples']
+                        found_nested = False
+                    
+                    if not found_nested:
+                        extracted_rows, found_nested = self._extract_nested_annotations(data, nested_keys)
+                        if found_nested:
+                            rows = extracted_rows
+                            self.logger.info(f"Found nested annotations: {len(rows)} items")
                             if max_rows:
                                 rows = rows[:max_rows]
-                            break
                     
                     # If no nested array found, check if all values are lists
                     if not found_nested:
-                        list_values = [v for v in data.values() if isinstance(v, list) and len(v) > 0]
+                        list_values = [(k, v) for k, v in data.items() 
+                                     if isinstance(v, list) and len(v) > 0 and k not in ['objects', 'bboxes']]
                         if list_values:
                             # Use the longest list (most likely to be annotations)
-                            rows = max(list_values, key=len)
-                            self.logger.info(f"Found list in dict values: {len(rows)} items")
+                            longest_key, longest_list = max(list_values, key=lambda x: len(x[1]))
+                            sample_item = longest_list[0] if longest_list else {}
+                            nested_has_image = isinstance(sample_item, dict) and (
+                                'image' in sample_item or 'image_id' in sample_item or 
+                                'image_name' in sample_item
+                            )
+                            
+                            if nested_has_image:
+                                rows = longest_list
+                            else:
+                                # Merge with parent context
+                                parent_context = {k: v for k, v in data.items() if k != longest_key}
+                                rows = []
+                                for item in longest_list:
+                                    if isinstance(item, dict):
+                                        merged = {**parent_context, **item}
+                                        rows.append(merged)
+                                    else:
+                                        rows.append(item)
+                            
+                            self.logger.info(f"Found list in dict values (key '{longest_key}'): {len(rows)} items")
                             if max_rows:
                                 rows = rows[:max_rows]
+                        elif has_caption or has_image:
+                            # Single annotation dict with caption/image - use as-is
+                            rows = [data]
+                            self.logger.info(f"Found single annotation dict with {'caption' if has_caption else 'image'} key")
                         else:
                             # Single object - wrap in list
                             rows = [data]
@@ -663,19 +742,34 @@ class AnnotationProcessor:
                     parsed = json.loads(line)
                     # Handle nested structures in JSONL too
                     if isinstance(parsed, dict):
+                        # Check for task-specific keys first
+                        has_caption = 'caption' in parsed or 'captions' in parsed
+                        has_image = 'image' in parsed or 'image_id' in parsed or 'image_name' in parsed
+                        
                         # Check for nested arrays
                         nested_keys = ['annotations', 'data', 'items', 'records', 'samples', 'examples']
-                        found_nested = False
-                        for key in nested_keys:
-                            if key in parsed and isinstance(parsed[key], list):
-                                # Expand nested array - add each item as a separate row
-                                for item in parsed[key]:
-                                    rows.append(item)
-                                found_nested = True
-                                break
+                        extracted_rows, found_nested = self._extract_nested_annotations(parsed, nested_keys)
+                        if found_nested:
+                            rows.extend(extracted_rows)
+                        
+                        # If no nested array but has caption/image, use as single annotation
                         if not found_nested:
-                            # No nested array, add the dict itself
-                            rows.append(parsed)
+                            if has_caption or has_image:
+                                rows.append(parsed)
+                            else:
+                                # Check for other list values
+                                list_values = [(k, v) for k, v in parsed.items() 
+                                             if isinstance(v, list) and len(v) > 0 and k not in ['objects', 'bboxes']]
+                                if list_values:
+                                    longest_key, longest_list = max(list_values, key=lambda x: len(x[1]))
+                                    parent_context = {k: v for k, v in parsed.items() if k != longest_key}
+                                    for item in longest_list:
+                                        if isinstance(item, dict):
+                                            rows.append({**parent_context, **item})
+                                        else:
+                                            rows.append(item)
+                                else:
+                                    rows.append(parsed)
                     else:
                         rows.append(parsed)
                 except json.JSONDecodeError as e:
@@ -1023,48 +1117,8 @@ class VRSBenchDataset(IterableDataset):
         return None
 
     def _normalize_bbox(self, bbox: List[float], img_width: int, img_height: int) -> List[float]:
-        """
-        Normalize bbox to [x, y, w, h] in pixels.
-        Handles:
-        - Normalized coords (0..1) -> convert to pixels
-        - Corner format [x1,y1,x2,y2] -> convert to [x,y,w,h]
-        - Already pixel coords [x,y,w,h] -> return as-is
-        """
-        if not bbox or len(bbox) < 4:
-            return bbox
-
-        x1, y1, x2_or_w, y2_or_h = bbox[:4]
-
-        # Detect if normalized (all values <= 1.0)
-        if all(v <= 1.0 for v in [x1, y1, x2_or_w, y2_or_h]):
-            # Normalized coords - could be [x1,y1,x2,y2] or [x,y,w,h]
-            # Check if x2_or_w + x1 > 1.0 (indicating it's width, not x2)
-            if x2_or_w < x1 or y2_or_h < y1:
-                # It's [x,y,w,h] in normalized form
-                x = int(x1 * img_width)
-                y = int(y1 * img_height)
-                w = int(x2_or_w * img_width)
-                h = int(y2_or_h * img_height)
-            else:
-                # It's [x1,y1,x2,y2] in normalized form
-                x = int(x1 * img_width)
-                y = int(y1 * img_height)
-                w = int((x2_or_w - x1) * img_width)
-                h = int((y2_or_h - y1) * img_height)
-            return [x, y, w, h]
-
-        # Check if it's corner format [x1,y1,x2,y2] in pixels
-        # (x2 > x1 and x2 > img_width/2 suggests corner format)
-        if x2_or_w > x1 and y2_or_h > y1 and x2_or_w > x1 + 10:
-            # Convert corner to xywh
-            x = int(x1)
-            y = int(y1)
-            w = int(x2_or_w - x1)
-            h = int(y2_or_h - y1)
-            return [x, y, w, h]
-
-        # Already in [x,y,w,h] pixel format
-        return [int(x1), int(y1), int(x2_or_w), int(y2_or_h)]
+        """Normalize bbox using TaskProcessor (consolidated logic)"""
+        return self.task_processor.normalize_bbox(bbox, img_width, img_height)
 
     def _guess_image_key(self, item: Dict[str, Any]) -> Optional[str]:
         """Guess image key from annotation dict"""
@@ -1087,9 +1141,17 @@ class VRSBenchDataset(IterableDataset):
         return None
 
     def _load_annotations(self) -> Iterator[Dict[str, Any]]:
-        """Load annotations from various sources"""
-        # Priority: annotations object -> local jsonl -> download URL
-
+        """
+        Load annotations from various sources.
+        
+        Priority order:
+        1. Pre-loaded annotations (HF Dataset or list) - passed via annotations parameter
+        2. Local JSONL file - passed via annotations_jsonl parameter
+        3. Download from URL - passed via annotations_url parameter
+        
+        Note: HuggingFace streaming dataset loading is handled by create_vrsbench_dataloader()
+        before creating VRSBenchDataset, so annotations parameter will contain the HF dataset.
+        """
         if self.annotations is not None:
             self.logger.info("Using pre-loaded annotations")
             if hasattr(self.annotations, '__iter__') and not isinstance(self.annotations, dict):
@@ -1131,19 +1193,8 @@ class VRSBenchDataset(IterableDataset):
                 # JSON file - use AnnotationProcessor to handle it properly
                 dataset = self.ann_processor.to_dataset(self.annotations_jsonl)
                 
-                # Handle different dataset types
-                if isinstance(dataset, list):
-                    for item in dataset:
-                        yield item
-                elif HAS_DATASETS and hasattr(dataset, '__iter__'):
-                    for item in dataset:
-                        yield dict(item) if isinstance(item, dict) else item
-                elif isinstance(dataset, pd.DataFrame):
-                    for _, row in dataset.iterrows():
-                        yield row.to_dict()
-                else:
-                    for item in dataset:
-                        yield item
+                # Handle different dataset types (consolidated iteration)
+                yield from self.ann_processor._iterate_dataset(dataset)
             return
 
         if self.annotations_url is not None:
@@ -1157,72 +1208,27 @@ class VRSBenchDataset(IterableDataset):
             # Extract and load
             extracted = self.ann_processor.extract_from_zip(zip_path)
             if extracted:
-                # Separate JSONL and JSON files (prefer JSONL)
+                # Find annotation files (JSONL or JSON)
                 jsonl_files = [f for f in extracted if f.endswith('.jsonl')]
                 json_files = [f for f in extracted if f.endswith('.json') and not f.endswith('.jsonl')]
                 
-                # Try to find task-specific file (e.g., captioning.jsonl for captioning task)
+                # Simple selection: prefer JSONL, then JSON, then first file
                 selected_file = None
-                task_file_patterns = {
-                    'captioning': ['caption'],
-                    'classification': ['classif', 'class'],
-                    'vqa': ['vqa', 'qa'],
-                    'detection': ['detect', 'det'],
-                    'grounding': ['ground', 'grounding']
-                }
+                if jsonl_files:
+                    selected_file = jsonl_files[0]
+                elif json_files:
+                    selected_file = json_files[0]
+                elif extracted:
+                    selected_file = extracted[0]
                 
-                # First, look for task-specific JSONL files (preferred)
-                if self.task in task_file_patterns:
-                    patterns = task_file_patterns[self.task]
-                    for pattern in patterns:
-                        for f in jsonl_files:
-                            if pattern.lower() in os.path.basename(f).lower():
-                                selected_file = f
-                                break
-                        if selected_file:
-                            break
-                
-                # If no task-specific JSONL found, look for task-specific JSON
-                if not selected_file and self.task in task_file_patterns:
-                    patterns = task_file_patterns[self.task]
-                    for pattern in patterns:
-                        for f in json_files:
-                            if pattern.lower() in os.path.basename(f).lower():
-                                selected_file = f
-                                break
-                        if selected_file:
-                            break
-                
-                # Fallback: prefer first JSONL file, then first JSON file
                 if not selected_file:
-                    if jsonl_files:
-                        selected_file = jsonl_files[0]
-                    elif json_files:
-                        selected_file = json_files[0]
-                    else:
-                        selected_file = extracted[0]
+                    raise RuntimeError(f"No annotation files found in {zip_path}")
                 
                 self.logger.info(f"Using annotation file: {os.path.basename(selected_file)}")
                 dataset = self.ann_processor.to_dataset(selected_file)
 
-                # Handle different dataset types
-                if isinstance(dataset, list):
-                    # List of dicts - yield directly
-                    for item in dataset:
-                        yield item
-                elif HAS_DATASETS and hasattr(dataset, '__iter__'):
-                    # HuggingFace Dataset - iterate over it
-                    for item in dataset:
-                        # HuggingFace Dataset yields dicts directly
-                        yield dict(item) if isinstance(item, dict) else item
-                elif isinstance(dataset, pd.DataFrame):
-                    # DataFrame - convert to dict records
-                    for _, row in dataset.iterrows():
-                        yield row.to_dict()
-                else:
-                    # Fallback: try to iterate
-                    for item in dataset:
-                        yield item
+                # Handle different dataset types (consolidated iteration)
+                yield from self.ann_processor._iterate_dataset(dataset)
             return
 
         raise RuntimeError("No annotation source provided")
@@ -1340,16 +1346,13 @@ class VRSBenchDataset(IterableDataset):
                         else:
                             img_tensor = transforms.ToTensor()(img)
 
-                    # Add resolved image path to metadata for downstream use
+                    # Add resolved image path and size to metadata
                     item['_image_path'] = image_path
                     item['_image_size'] = (img_width, img_height)
 
                     load_time = time.time() - start_time
                     self.metrics.record_time("image_load", load_time)
                     self.metrics.increment("images_loaded")
-
-                    # Inject resolved image path into metadata for downstream use
-                    item['_image_path'] = image_path
 
                 except Exception as e:
                     self.metrics.record_error("image_load_error")
@@ -1425,12 +1428,13 @@ def _detect_image_directory(base_dir: str) -> str:
 # ========================= DataLoader Factory =========================
 
 def create_vrsbench_dataloader(
-    images_dir: str,
+    images_dir: Optional[str] = None,
     task: str = "classification",
+    hf_dataset_name: str = "xiang709/VRSBench",
+    split: str = "validation",
     annotations: Optional[Any] = None,
     annotations_jsonl: Optional[str] = None,
     annotations_url: Optional[str] = None,
-    split: str = "validation",
     image_key: Optional[str] = None,
     transform: Optional[Callable] = None,
     batch_size: int = 16,
@@ -1438,77 +1442,187 @@ def create_vrsbench_dataloader(
     sample_size: Optional[int] = None,
     expand_multi_annotations: bool = False,
     region_based: bool = False,
-    download_images: bool = False,
+    download_images: bool = True,
     images_url: Optional[str] = None,
     config: Optional[VRSBenchConfig] = None,
     return_metrics: bool = False
 ) -> Union[DataLoader, Tuple[DataLoader, MetricsCollector]]:
     """
-    Create production-ready VRSBench DataLoader
+    Create production-ready VRSBench DataLoader.
+    
+    **This is a convenience wrapper** around the high-level API:
+    - Calls `prepare_vrsbench_dataset()` to download images and load HuggingFace streaming dataset
+    - Calls `create_dataloader_from_prepared()` to create the DataLoader
+    
+    **Primary workflow**: Uses HuggingFace streaming datasets (recommended).
+    **Legacy fallback**: Supports JSONL files for custom datasets (deprecated).
 
     Args:
-        images_dir: Directory containing images
+        images_dir: Directory to store images (default: ./Images_{split})
         task: Task type (classification, detection, captioning, vqa, grounding)
-        annotations: Pre-loaded annotations
-        annotations_jsonl: Path to local JSONL
-        annotations_url: URL to download annotations
-        split: Dataset split
-        image_key: Key for image in annotations
+        hf_dataset_name: HuggingFace dataset identifier (default: "xiang709/VRSBench")
+        split: Dataset split (train/validation/test)
+        sample_size: Limit number of samples (None = all)
+        download_images: Download images if not present (default: True)
+        images_url: URL for image zip (auto-detected from split if not provided)
         transform: Image transforms (defaults to 256x256 resize)
         batch_size: Batch size
         num_workers: Number of worker processes
-        sample_size: Limit number of samples
-        expand_multi_annotations: Expand multi-annotation items
-        region_based: Extract regions for grounding tasks
-        download_images: Download images if not present
-        images_url: URL for image zip
         config: Configuration object
         return_metrics: Return metrics collector along with dataloader
+        
+        # Legacy parameters (deprecated - use prepare_vrsbench_dataset + create_dataloader_from_prepared):
+        annotations: Pre-loaded annotations (not used in primary workflow)
+        annotations_jsonl: Path to local JSONL file (fallback, deprecated)
+        annotations_url: URL to download annotations (fallback, deprecated)
+        image_key: Key for image in annotations (auto-detected)
+        expand_multi_annotations: Expand multi-annotation items (not supported in high-level API)
+        region_based: Extract regions for grounding tasks (not supported in high-level API)
 
     Returns:
         DataLoader or (DataLoader, MetricsCollector)
+    
+    Example:
+        >>> # Primary workflow: Direct HuggingFace streaming dataset
+        >>> dataloader = create_vrsbench_dataloader(
+        ...     task="captioning",
+        ...     split="validation",
+        ...     download_images=True
+        ... )
+        >>> 
+        >>> # For better control, use the high-level API directly:
+        >>> from vrsbench_dataloader_production import prepare_vrsbench_dataset, create_dataloader_from_prepared
+        >>> data = prepare_vrsbench_dataset(split="validation", task="captioning", num_samples=1000)
+        >>> dataloader = create_dataloader_from_prepared(data, batch_size=16)
     """
 
     config = config or VRSBenchConfig()
     logger = StructuredLogger("DataLoaderFactory", config)
+    
+    # Legacy fallback: If annotations_jsonl or annotations_url provided, use old VRSBenchDataset
+    if annotations_jsonl is not None or annotations_url is not None:
+        logger.warning(
+            "Using legacy JSONL/URL annotation loading. "
+            "Consider using prepare_vrsbench_dataset() + create_dataloader_from_prepared() instead."
+        )
+        return _create_legacy_dataloader(
+            images_dir=images_dir or f"./Images_{split}",
+            task=task,
+            annotations=annotations,
+            annotations_jsonl=annotations_jsonl,
+            annotations_url=annotations_url,
+            split=split,
+            image_key=image_key,
+            transform=transform,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            sample_size=sample_size,
+            expand_multi_annotations=expand_multi_annotations,
+            region_based=region_based,
+            download_images=download_images,
+            images_url=images_url,
+            hf_dataset_name=hf_dataset_name,
+            config=config,
+            return_metrics=return_metrics
+        )
+    
+    # Primary workflow: Use high-level API
+    logger.info(f"Creating DataLoader for task={task}, split={split} using high-level API")
+    
+    # Prepare dataset using high-level API
+    prepared_data = prepare_vrsbench_dataset(
+        split=split,
+        task=task,
+        images_dir=images_dir,
+        num_samples=sample_size,
+        hf_dataset_name=hf_dataset_name,
+        download_images=download_images,
+        images_url=images_url,
+        config=config,
+        force_download=False
+    )
+    
+    # Create DataLoader from prepared data
+    dataloader = create_dataloader_from_prepared(
+        prepared_data=prepared_data,
+        task=task,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        transform=transform,
+        config=config
+    )
+    
+    logger.info("DataLoader created successfully using high-level API")
+    
+    if return_metrics:
+        # Create a metrics collector for compatibility
+        metrics = MetricsCollector()
+        return dataloader, metrics
+    return dataloader
+
+
+def _create_legacy_dataloader(
+    images_dir: str,
+    task: str,
+    annotations: Optional[Any],
+    annotations_jsonl: Optional[str],
+    annotations_url: Optional[str],
+    split: str,
+    image_key: Optional[str],
+    transform: Optional[Callable],
+    batch_size: int,
+    num_workers: int,
+    sample_size: Optional[int],
+    expand_multi_annotations: bool,
+    region_based: bool,
+    download_images: bool,
+    images_url: Optional[str],
+    hf_dataset_name: str,
+    config: VRSBenchConfig,
+    return_metrics: bool
+) -> Union[DataLoader, Tuple[DataLoader, MetricsCollector]]:
+    """Legacy implementation for JSONL/URL fallback (deprecated)"""
+    logger = StructuredLogger("LegacyDataLoader", config)
     metrics = MetricsCollector()
-
-    logger.info(f"Creating DataLoader for task={task}, split={split}, batch_size={batch_size}")
-
+    
+    os.makedirs(images_dir, exist_ok=True)
+    
     # Download images if requested
     if download_images:
         if not images_url:
-            images_url = config.IMAGES_URL
-
-        logger.info(f"Downloading images to {images_dir}")
-        os.makedirs(images_dir, exist_ok=True)
-
+            if split == "validation":
+                images_url = "https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/Images_val.zip"
+            elif split == "train":
+                images_url = "https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/Images_train.zip"
+        
         download_mgr = DownloadManager(config, logger, metrics)
         zip_path = os.path.join(images_dir, os.path.basename(images_url))
         download_mgr.download_with_retries(images_url, zip_path)
-
-        # Extract
-        logger.info("Extracting images...")
+        
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(images_dir)
-        logger.info(f"Images extracted to {images_dir}")
         
-        # Auto-detect actual image directory after extraction
-        # Images might be in a subdirectory (e.g., Images_val.zip extracts to Images_val/)
         actual_images_dir = _detect_image_directory(images_dir)
         if actual_images_dir != images_dir:
-            logger.info(f"Images found in subdirectory: {actual_images_dir}")
             images_dir = actual_images_dir
-
-    # Default transform
+    
+    # Load HuggingFace streaming dataset if annotations not provided
+    if annotations is None and annotations_jsonl is None and annotations_url is None:
+        if HAS_DATASETS and load_dataset is not None:
+            try:
+                hf_dataset = load_dataset(hf_dataset_name, streaming=True)
+                if split in hf_dataset:
+                    annotations = hf_dataset[split]
+            except Exception as e:
+                logger.warning(f"Could not load from HuggingFace: {e}")
+    
     if transform is None:
         transform = transforms.Compose([
             transforms.Resize(config.DEFAULT_IMAGE_SIZE),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-
-    # Create dataset
+    
     dataset = VRSBenchDataset(
         images_dir=images_dir,
         task=task,
@@ -1525,14 +1639,12 @@ def create_vrsbench_dataloader(
         logger=logger,
         metrics=metrics
     )
-
-    # Collate function
+    
     def collate_fn(batch):
         images = torch.stack([b[0] for b in batch])
         metas = [b[1] for b in batch]
         return images, metas
-
-    # Create dataloader
+    
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -1541,9 +1653,7 @@ def create_vrsbench_dataloader(
         pin_memory=config.PIN_MEMORY,
         prefetch_factor=config.PREFETCH_FACTOR if num_workers > 0 else None
     )
-
-    logger.info("DataLoader created successfully")
-
+    
     if return_metrics:
         return dataloader, metrics
     return dataloader
@@ -1578,4 +1688,462 @@ def get_task_targets(
         return processor.extract_bboxes(metas)
     else:
         raise ValueError(f"Unsupported task: {task}")
+
+# ========================= High-Level Workflow API =========================
+
+def prepare_vrsbench_dataset(
+    split: str = "validation",
+    task: str = "captioning",
+    images_dir: Optional[str] = None,
+    num_samples: Optional[int] = None,
+    hf_dataset_name: str = "xiang709/VRSBench",
+    hf_token: Optional[str] = None,
+    download_images: bool = True,
+    images_url: Optional[str] = None,
+    output_json: Optional[str] = None,
+    config: Optional[VRSBenchConfig] = None,
+    force_download: bool = False
+) -> Dict[str, Any]:
+    """
+    High-level function to prepare VRSBench dataset for any task.
+    
+    This function automates the entire workflow:
+    1. Downloads images from HuggingFace (if needed)
+    2. Extracts images to local directory
+    3. Loads HuggingFace streaming dataset
+    4. Combines streaming dataset metadata with local images
+    5. Returns easy-to-use data structure with task-specific mappings
+    6. Optionally saves to JSON for easy access
+    
+    This replaces the manual workflow of:
+    - curl downloads
+    - unzip operations
+    - HuggingFace dataset loading
+    - Manual image-metadata mapping
+    
+    Args:
+        split: Dataset split ("train" or "validation")
+        task: Task type ("classification", "detection", "captioning", "vqa", "grounding")
+        images_dir: Directory to store images (default: ./Images_{split})
+        num_samples: Limit number of samples (None = all)
+        hf_dataset_name: HuggingFace dataset identifier
+        hf_token: HuggingFace token (or use HUGGINGFACE_HUB_TOKEN env var)
+        download_images: Whether to download images (default: True)
+        images_url: Custom URL for images (default: auto-detect from split)
+        output_json: Path to save JSON mapping (optional)
+        config: Configuration object (optional)
+        force_download: Force re-download even if images exist
+    
+    Returns:
+        Dictionary with:
+        - "samples": List of sample dicts with image_path and task-specific metadata
+        - Task-specific mappings (e.g., "image_to_caption" for captioning, "image_to_label" for classification)
+        - "id_to_path": Dict mapping image_id -> image_path
+        - "split": Dataset split used
+        - "task": Task type used
+        - "num_samples": Number of samples loaded
+    
+    Example:
+        >>> # For captioning task
+        >>> data = prepare_vrsbench_dataset(split="validation", task="captioning", num_samples=1000)
+        >>> image_to_caption = data["image_to_caption"]
+        >>> 
+        >>> # For classification task
+        >>> data = prepare_vrsbench_dataset(split="validation", task="classification", num_samples=1000)
+        >>> image_to_label = data["image_to_label"]
+        >>> 
+        >>> # For VQA task
+        >>> data = prepare_vrsbench_dataset(split="validation", task="vqa", num_samples=1000)
+        >>> # Access qa_pairs from samples
+    """
+    if not HAS_DATASETS:
+        raise ImportError(
+            "HuggingFace datasets library is required. Install with: pip install datasets"
+        )
+    
+    config = config or VRSBenchConfig()
+    
+    # Validate task
+    if task not in config.SUPPORTED_TASKS:
+        raise ValueError(f"Unsupported task: {task}. Choose from {config.SUPPORTED_TASKS}")
+    
+    logger = StructuredLogger("VRSBenchWorkflow", config)
+    metrics = MetricsCollector()
+    download_mgr = DownloadManager(config, logger, metrics)
+    task_processor = TaskProcessor()
+    
+    # Set up images directory
+    if images_dir is None:
+        images_dir = f"./Images_{split}"
+    
+    os.makedirs(images_dir, exist_ok=True)
+    
+    # Download images if needed
+    if download_images:
+        # Auto-detect image URL based on split
+        if images_url is None:
+            if split == "validation":
+                images_url = "https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/Images_val.zip"
+            elif split == "train":
+                images_url = "https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/Images_train.zip"
+            else:
+                raise ValueError(f"Unknown split: {split}. Use 'train' or 'validation'")
+        
+        logger.info(f"Downloading images for {split} split...")
+        
+        # Check if images already exist
+        zip_name = os.path.basename(images_url)
+        zip_path = os.path.join(images_dir, zip_name)
+        
+        # Check if images are already extracted
+        actual_images_dir = _detect_image_directory(images_dir)
+        has_images = False
+        if os.path.exists(actual_images_dir):
+            image_files = [f for f in os.listdir(actual_images_dir) 
+                          if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            has_images = len(image_files) > 0
+        
+        if not force_download and has_images:
+            logger.info(f"Images already exist in {actual_images_dir}, skipping download")
+            images_dir = actual_images_dir
+        else:
+            # Download zip file
+            download_mgr.download_with_retries(images_url, zip_path, force=force_download)
+            
+            # Extract images
+            logger.info(f"Extracting images to {images_dir}...")
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(images_dir)
+            
+            # Auto-detect actual image directory (might be in subdirectory)
+            actual_images_dir = _detect_image_directory(images_dir)
+            if actual_images_dir != images_dir:
+                logger.info(f"Images found in subdirectory: {actual_images_dir}")
+                images_dir = actual_images_dir
+    
+    # Load HuggingFace streaming dataset
+    logger.info(f"Loading HuggingFace dataset: {hf_dataset_name}")
+    
+    # Set up authentication if token provided
+    if hf_token:
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
+    
+    try:
+        hf_dataset = load_dataset(hf_dataset_name, streaming=True)
+    except Exception as e:
+        logger.error(f"Failed to load HuggingFace dataset: {e}")
+        raise
+    
+    if split not in hf_dataset:
+        raise ValueError(f"Split '{split}' not found in dataset. Available: {list(hf_dataset.keys())}")
+    
+    dataset_iterator = hf_dataset[split]
+    
+    # Combine streaming dataset with local images
+    logger.info(f"Combining streaming dataset with local images...")
+    if num_samples:
+        logger.info(f"Extracting {num_samples} samples from {split} set...")
+    else:
+        logger.info(f"Extracting all samples from {split} set...")
+    
+    # Initialize task-specific mappings
+    test_data = {
+        "samples": [],
+        "id_to_path": {},
+        "split": split,
+        "task": task,
+        "num_samples": 0
+    }
+    
+    # Add task-specific mapping keys
+    if task == "captioning":
+        test_data["image_to_caption"] = {}
+    elif task == "classification":
+        test_data["image_to_label"] = {}
+    elif task == "vqa":
+        test_data["image_to_qa_pairs"] = {}
+    elif task in ["detection", "grounding"]:
+        test_data["image_to_bboxes"] = {}
+    
+    count = 0
+    skipped = 0
+    
+    # Get list of local image files for matching
+    local_image_files = {}
+    if os.path.exists(images_dir):
+        for root, dirs, files in os.walk(images_dir):
+            # Skip hidden dirs and macOS metadata
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__MACOSX']
+            for file in files:
+                if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    file_path = os.path.join(root, file)
+                    # Store by basename for easy lookup
+                    basename = os.path.basename(file)
+                    # Remove extension for matching
+                    name_without_ext = os.path.splitext(basename)[0]
+                    local_image_files[name_without_ext] = file_path
+                    # Also store with full basename
+                    local_image_files[basename] = file_path
+    
+    logger.info(f"Found {len(local_image_files)} local image files")
+    
+    for idx, sample in enumerate(dataset_iterator):
+        if num_samples and count >= num_samples:
+            break
+        
+        try:
+            # Try to get image_id or construct one
+            image_id = None
+            if 'image_id' in sample:
+                image_id = str(sample['image_id'])
+            elif 'id' in sample:
+                image_id = str(sample['id'])
+            elif 'image_name' in sample:
+                image_id = str(sample['image_name'])
+            elif 'file_name' in sample:
+                image_id = str(sample['file_name'])
+            else:
+                # Construct from index
+                image_id = f"{split}_{idx:05d}"
+            
+            # Remove extension from image_id for matching
+            image_id_base = os.path.splitext(image_id)[0]
+            
+            # Find corresponding local image file
+            image_path = None
+            
+            # Strategy 1: Direct match by image_id (with or without extension)
+            if image_id in local_image_files:
+                image_path = local_image_files[image_id]
+            elif image_id_base in local_image_files:
+                image_path = local_image_files[image_id_base]
+            else:
+                # Strategy 2: Try common patterns
+                possible_names = [
+                    image_id,
+                    image_id_base,
+                    f"{image_id}.png",
+                    f"{image_id}.jpg",
+                    f"{image_id}.jpeg",
+                    f"{image_id_base}.png",
+                    f"{image_id_base}.jpg",
+                    f"{image_id_base}.jpeg",
+                ]
+                
+                for name in possible_names:
+                    if name in local_image_files:
+                        image_path = local_image_files[name]
+                        break
+                
+                # Strategy 3: Index-based matching (fallback)
+                if image_path is None:
+                    sorted_files = sorted(local_image_files.items())
+                    if idx < len(sorted_files):
+                        image_path = sorted_files[idx][1]
+            
+            if image_path and os.path.exists(image_path):
+                # Store path mapping
+                test_data["id_to_path"][image_id] = image_path
+                
+                # Extract task-specific metadata
+                sample_info = {
+                    "image_id": image_id,
+                    "image_path": image_path,
+                    "dataset_index": idx
+                }
+                
+                # Extract task-specific targets
+                if task == "captioning":
+                    caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
+                    sample_info["caption"] = caption
+                    test_data["image_to_caption"][image_id] = caption
+                elif task == "classification":
+                    # Try to find label
+                    label = None
+                    for key in ['label', 'category', 'class', 'target', 'class_id']:
+                        if key in sample:
+                            label = sample[key]
+                            break
+                    if label is not None:
+                        sample_info["label"] = label
+                        test_data["image_to_label"][image_id] = label
+                elif task == "vqa":
+                    qa_pairs = sample.get('qa_pairs', [])
+                    if qa_pairs:
+                        sample_info["qa_pairs"] = qa_pairs
+                        test_data["image_to_qa_pairs"][image_id] = qa_pairs
+                    elif 'question' in sample and 'answer' in sample:
+                        qa_pair = [(sample['question'], sample['answer'])]
+                        sample_info["qa_pairs"] = qa_pair
+                        test_data["image_to_qa_pairs"][image_id] = qa_pair
+                elif task in ["detection", "grounding"]:
+                    bboxes = []
+                    if 'bbox' in sample:
+                        bboxes = [sample['bbox']]
+                    elif 'bboxes' in sample:
+                        bboxes = sample['bboxes']
+                    elif 'objects' in sample:
+                        bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+                    if bboxes:
+                        sample_info["bboxes"] = bboxes
+                        test_data["image_to_bboxes"][image_id] = bboxes
+                
+                # Add all other fields from dataset
+                for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
+                           'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
+                    if key in sample and key not in sample_info:
+                        sample_info[key] = sample[key]
+                
+                test_data["samples"].append(sample_info)
+                
+                count += 1
+                if count % 100 == 0:
+                    logger.info(f"✓ [{count}/{num_samples if num_samples else 'all'}] Processed samples...")
+            else:
+                skipped += 1
+                if skipped <= 10:
+                    logger.warning(f"⚠ Skipped sample {idx}: Image not found for image_id={image_id}")
+                
+        except Exception as e:
+            skipped += 1
+            if skipped <= 10:
+                logger.warning(f"⚠ Error processing sample {idx}: {e}")
+            continue
+    
+    test_data["num_samples"] = count
+    
+    logger.info(f"✓ Created dataset with {count} samples (skipped {skipped})")
+    
+    # Save to JSON if requested
+    if output_json:
+        logger.info(f"Saving to JSON: {output_json}")
+        with open(output_json, 'w') as f:
+            json.dump(test_data, f, indent=2)
+        logger.info(f"✓ Saved to: {output_json}")
+    
+    return test_data
+
+
+def create_dataloader_from_prepared(
+    prepared_data: Dict[str, Any],
+    task: Optional[str] = None,
+    batch_size: int = 16,
+    num_workers: int = 4,
+    transform: Optional[Callable] = None,
+    config: Optional[VRSBenchConfig] = None
+) -> DataLoader:
+    """
+    Create a PyTorch DataLoader from prepared dataset.
+    
+    This is a convenience function that converts the output of prepare_vrsbench_dataset()
+    into a PyTorch DataLoader for training/inference. Works for all tasks.
+    
+    Args:
+        prepared_data: Output from prepare_vrsbench_dataset()
+        task: Task type (auto-detected from prepared_data if not provided)
+        batch_size: Batch size for DataLoader
+        num_workers: Number of worker processes
+        transform: Image transforms (default: resize to 256x256)
+        config: Configuration object
+    
+    Returns:
+        PyTorch DataLoader yielding (image_tensor, metadata_dict) batches
+    
+    Example:
+        >>> # For any task
+        >>> data = prepare_vrsbench_dataset(split="validation", task="classification", num_samples=1000)
+        >>> dataloader = create_dataloader_from_prepared(data, batch_size=16)
+        >>> 
+        >>> for images, metas in dataloader:
+        ...     labels = get_task_targets(metas, task="classification")
+        ...     # Train your model
+    """
+    config = config or VRSBenchConfig()
+    
+    # Auto-detect task from prepared_data if not provided
+    if task is None:
+        task = prepared_data.get("task", "captioning")
+    
+    # Validate task
+    if task not in config.SUPPORTED_TASKS:
+        raise ValueError(f"Unsupported task: {task}. Choose from {config.SUPPORTED_TASKS}")
+    
+    logger = StructuredLogger("PreparedDataLoader", config)
+    
+    if not prepared_data.get("samples"):
+        raise ValueError("prepared_data has no samples")
+    
+    # Default transform
+    if transform is None:
+        transform = transforms.Compose([
+            transforms.Resize(config.DEFAULT_IMAGE_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
+    # Create a simple dataset from prepared data
+    class PreparedDataset(IterableDataset):
+        def __init__(self, samples, transform):
+            self.samples = samples
+            self.transform = transform
+        
+        def __iter__(self):
+            for sample in self.samples:
+                try:
+                    image_path = sample["image_path"]
+                    with Image.open(image_path) as img:
+                        img = img.convert('RGB')
+                        if self.transform:
+                            img_tensor = self.transform(img)
+                        else:
+                            img_tensor = transforms.ToTensor()(img)
+                    
+                    # Return image and metadata
+                    yield img_tensor, sample
+                except Exception as e:
+                    logger.warning(f"Failed to load image {sample.get('image_path', 'unknown')}: {e}")
+                    continue
+    
+    dataset = PreparedDataset(prepared_data["samples"], transform)
+    
+    def collate_fn(batch):
+        images = torch.stack([b[0] for b in batch])
+        metas = [b[1] for b in batch]
+        return images, metas
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=config.PIN_MEMORY,
+        prefetch_factor=config.PREFETCH_FACTOR if num_workers > 0 else None
+    )
+    
+    logger.info(f"Created DataLoader with {len(prepared_data['samples'])} samples for task: {task}")
+    return dataloader
+
+
+# Backward compatibility alias
+def create_captioning_dataloader_from_prepared(
+    prepared_data: Dict[str, Any],
+    batch_size: int = 16,
+    num_workers: int = 4,
+    transform: Optional[Callable] = None,
+    config: Optional[VRSBenchConfig] = None
+) -> DataLoader:
+    """
+    Backward compatibility alias for create_dataloader_from_prepared().
+    
+    This function is deprecated. Use create_dataloader_from_prepared() instead.
+    """
+    return create_dataloader_from_prepared(
+        prepared_data=prepared_data,
+        task="captioning",
+        batch_size=batch_size,
+        num_workers=num_workers,
+        transform=transform,
+        config=config
+    )
+
 
