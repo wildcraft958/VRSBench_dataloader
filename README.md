@@ -1,7 +1,7 @@
 # VRSBench DataLoader
 
 **Version:** 3.0.0  
-**Author:** Animesh Raj
+**Author:** Animesh Raj  
 
 Production-ready PyTorch DataLoader for the VRSBench (Vision-language for Remote Sensing) dataset. Built for enterprise workloads with hardened reliability, comprehensive logging, and multi-task abstractions that eliminate boilerplate across classification, detection, captioning, VQA, and visual grounding tasks.
 
@@ -18,7 +18,7 @@ Working with VRSBench typically means:
 
 This loader eliminates all of that. **One function call replaces 50+ lines of boilerplate.** It handles network failures, validates data integrity, tracks performance metrics, and provides structured logging out of the box.
 
-**Architecture**: The loader is designed around **HuggingFace streaming datasets as the primary workflow**. JSONL file support exists only as a fallback for custom datasets. You don't need JSONL files when working with the standard VRSBench dataset from HuggingFace.
+**Architecture**: The loader is built around a high-level API that automatically handles HuggingFace streaming datasets, image downloads, and data preparation. All functionality is consolidated under `prepare_vrsbench_dataset()` and `create_dataloader_from_prepared()`. The standard `create_vrsbench_dataloader()` function is now a convenience wrapper around these high-level functions.
 
 ## What It Does
 
@@ -48,11 +48,128 @@ pip install -e .
 - torchvision >= 0.13
 - Pillow >= 9.0
 - pandas >= 1.3
-- requests >= 2.27
-- tqdm >= 4.62
+- datasets >= 2.0.0 (recommended, for HuggingFace integration)
 
-**Optional (recommended):**
-- `datasets >= 2.0` (HuggingFace datasets library) - enables streaming dataset support
+## Using in Google Colab
+
+The VRSBench DataLoader works seamlessly in Google Colab notebooks. Here's how to set it up:
+
+### Option 1: Install from GitHub (Recommended)
+
+```python
+# Install dependencies
+!pip install -q torch torchvision pillow pandas requests tqdm datasets
+
+# Clone or upload the dataloader module
+# Option A: Clone from GitHub (if your repo is public)
+!git clone https://github.com/yourusername/VRSBench_dataloader.git /content/vrsbench_dataloader
+import sys
+sys.path.insert(0, '/content/vrsbench_dataloader')
+
+# Option B: Upload the module file directly
+from google.colab import files
+uploaded = files.upload()  # Upload vrsbench_dataloader_production.py
+```
+
+### Option 2: Direct Import (If Module is in Colab)
+
+If you've uploaded `vrsbench_dataloader_production.py` to Colab:
+
+```python
+# Import directly
+from vrsbench_dataloader_production import (
+    prepare_vrsbench_dataset,
+    create_dataloader_from_prepared,
+    create_vrsbench_dataloader,
+    get_task_targets
+)
+```
+
+### Complete Colab Example
+
+```python
+# Step 1: Install dependencies
+!pip install -q torch torchvision pillow pandas requests tqdm datasets
+
+# Step 2: Set up HuggingFace token (optional, but recommended)
+import os
+os.environ["HUGGINGFACE_HUB_TOKEN"] = "your_token_here"  # Get from https://huggingface.co/settings/tokens
+
+# Step 3: Import the dataloader (after uploading/cloning)
+from vrsbench_dataloader_production import prepare_vrsbench_dataset, create_dataloader_from_prepared
+
+# Step 4: Prepare dataset (downloads images and loads HF dataset automatically)
+data = prepare_vrsbench_dataset(
+    split="validation",
+    task="captioning",
+    num_samples=1000,  # Limit for faster testing
+    download_images=True
+)
+
+print(f"✓ Loaded {data['num_samples']} samples")
+print(f"✓ Images directory: {data.get('images_dir', 'N/A')}")
+
+# Step 5: Create DataLoader
+dataloader = create_dataloader_from_prepared(
+    data,
+    batch_size=16,
+    num_workers=2  # Use 2-4 workers in Colab
+)
+
+# Step 6: Use in your training loop
+for images, metas in dataloader:
+    captions = get_task_targets(metas, task="captioning")
+    # images: torch.Tensor of shape [batch_size, 3, H, W]
+    # captions: List[str] of ground truth captions
+    # Train your model here
+    break  # Remove break for full training
+```
+
+### Colab-Specific Tips
+
+1. **GPU Runtime**: Enable GPU for faster image processing:
+   - Runtime → Change runtime type → GPU (T4 or better)
+
+2. **Memory Management**: 
+   - Use `num_samples` to limit dataset size during testing
+   - Set `num_workers=2` or `0` to reduce memory usage
+   - Images are downloaded to Colab's `/content` directory (~5GB for validation set)
+
+3. **HuggingFace Authentication**:
+   ```python
+   from huggingface_hub import login
+   login(token="your_token_here")
+   # Or use environment variable:
+   # os.environ["HUGGINGFACE_HUB_TOKEN"] = "your_token_here"
+   ```
+
+4. **Persistent Storage**: 
+   - Colab sessions reset, so images will re-download each session
+   - Consider using Google Drive for persistent storage:
+   ```python
+   from google.colab import drive
+   drive.mount('/content/drive')
+   
+   # Use Drive path for images_dir
+   data = prepare_vrsbench_dataset(
+       split="validation",
+       images_dir="/content/drive/MyDrive/VRSBench/Images_val",
+       download_images=True
+   )
+   ```
+
+5. **Quick Test**:
+   ```python
+   # Test with just 10 samples
+   data = prepare_vrsbench_dataset(
+       split="validation",
+       task="captioning",
+       num_samples=10,
+       download_images=True
+   )
+   print(f"Sample keys: {list(data.keys())}")
+   print(f"First caption: {list(data['image_to_caption'].values())[0]}")
+   ```
 
 ## Quick Start: Your First 5 Minutes
 
@@ -99,7 +216,7 @@ fw = load_dataset("xiang709/VRSBench", streaming=True)
 
 ### For All Tasks (Primary Workflow)
 
-**The recommended approach**: Use HuggingFace streaming datasets directly. No JSONL files needed.
+**The recommended approach**: Use HuggingFace streaming datasets directly.
 
 ```python
 from vrsbench_dataloader_production import create_vrsbench_dataloader, get_task_targets
@@ -118,10 +235,10 @@ dataloader = create_vrsbench_dataloader(
 for images, metas in dataloader:
     # images: torch.Tensor [B, 3, H, W]
     # metas: List[Dict] with task-specific metadata
-    
+
     # Extract task targets
     labels = get_task_targets(metas, task="classification")
-    
+
     # Your training code
     outputs = model(images)
     loss = criterion(outputs, labels)
@@ -134,7 +251,7 @@ for images, metas in dataloader:
 - Maps streaming dataset metadata to local images
 - Returns PyTorch DataLoader ready for training
 
-**No JSONL files needed** - the loader works directly with HuggingFace datasets.
+The loader works directly with HuggingFace streaming datasets.
 
 ## Task-Specific Usage
 
@@ -159,12 +276,6 @@ for images, metas in dataloader:
     labels = get_task_targets(metas, task="classification", label_key="category")
     # labels: List[Any] - classification labels
 
-# Option 3: Fallback - Local JSONL file (only if you have custom annotations)
-dataloader = create_vrsbench_dataloader(
-    images_dir="./data/images",
-    task="classification",
-    annotations_jsonl="./data/annotations.jsonl"  # Fallback: local file
-)
 ```
 
 **API Behavior**: `prepare_vrsbench_dataset(task="classification")` creates `image_to_label` mapping. `get_task_targets()` searches for `label`, `category`, `class`, `target`, `class_id` in metadata. Specify `label_key` to override.
@@ -190,12 +301,6 @@ for images, metas in dataloader:
     bboxes = get_task_targets(metas, task="detection")
     # bboxes: List[List[float]] - [[x, y, w, h], ...] in pixel coordinates
 
-# Option 3: Fallback - Local JSONL file (only if you have custom annotations)
-dataloader = create_vrsbench_dataloader(
-    images_dir="./data/images",
-    task="detection",
-    annotations_jsonl="./data/detection_annotations.jsonl"  # Fallback: local file
-)
 ```
 
 **API Behavior**: `prepare_vrsbench_dataset(task="detection")` creates `image_to_bboxes` mapping. Bounding boxes are normalized to `[x, y, w, h]` pixel coordinates regardless of input format. Handles nested `objects` arrays and flat `bbox`/`bboxes` fields.
@@ -218,15 +323,9 @@ for sample in data["samples"]:
 # Option 2: Create DataLoader from prepared data
 dataloader = create_dataloader_from_prepared(data, batch_size=16)
 for images, metas in dataloader:
-    captions = get_task_targets(metas, task="captioning")
+captions = get_task_targets(metas, task="captioning")
     # captions: List[str]
 
-# Option 3: Fallback - Local JSONL file (only if you have custom annotations)
-dataloader = create_vrsbench_dataloader(
-    images_dir="./data/images",
-    task="captioning",
-    annotations_jsonl="./data/captioning_annotations.jsonl"  # Fallback: local file
-)
 ```
 
 **API Behavior**: `prepare_vrsbench_dataset(task="captioning")` downloads images, loads HuggingFace streaming dataset, and combines them. Returns dict with `samples`, `image_to_caption`, `id_to_path` mappings. Works identically for all tasks with task-specific mappings.
@@ -249,19 +348,12 @@ for sample in data["samples"]:
 # Option 2: Create DataLoader from prepared data
 dataloader = create_dataloader_from_prepared(data, batch_size=16)
 for images, metas in dataloader:
-    qa_pairs = get_task_targets(metas, task="vqa")
+qa_pairs = get_task_targets(metas, task="vqa")
     # qa_pairs: List[Tuple[str, str]] - [(question, answer), ...]
 
-# Option 3: Fallback - Local JSONL with expansion
-dataloader = create_vrsbench_dataloader(
-    images_dir="./data/images",
-    task="vqa",
-    annotations_jsonl="./data/vqa_annotations.jsonl",  # Fallback: local file
-    expand_multi_annotations=True  # One sample per QA pair
-)
 ```
 
-**API Behavior**: `prepare_vrsbench_dataset(task="vqa")` creates `image_to_qa_pairs` mapping. With `expand_multi_annotations=True`, each QA pair in `qa_pairs` array becomes a separate sample. Without it, takes first QA pair from each record.
+**API Behavior**: `prepare_vrsbench_dataset(task="vqa")` creates `image_to_qa_pairs` mapping. Each record's `qa_pairs` array is stored in the sample metadata.
 
 ### 5. Visual Grounding
 
@@ -276,25 +368,12 @@ data = prepare_vrsbench_dataset(
 )
 image_to_bboxes = data["image_to_bboxes"]
 
-# Option 2: Create DataLoader with region extraction
+# Option 2: Create DataLoader from prepared data
 dataloader = create_dataloader_from_prepared(data, batch_size=16)
-# Note: For region extraction, use standard DataLoader with region_based=True
 
-# Option 3: Fallback - Local JSONL with region extraction
-dataloader = create_vrsbench_dataloader(
-    images_dir="./data/images",
-    task="grounding",
-    annotations_jsonl="./data/grounding_annotations.jsonl",  # Fallback: local file
-    region_based=True,  # Extract cropped regions using bboxes
-    expand_multi_annotations=True  # One sample per object
-)
-
-for images, metas in dataloader:
-    bboxes = get_task_targets(metas, task="grounding")
-    # images are already cropped regions if region_based=True
 ```
 
-**API Behavior**: `prepare_vrsbench_dataset(task="grounding")` creates `image_to_bboxes` mapping. `region_based=True` crops images to bounding box regions (with 10px padding by default). `expand_multi_annotations=True` creates one sample per object in `objects` array.
+**API Behavior**: `prepare_vrsbench_dataset(task="grounding")` creates `image_to_bboxes` mapping. Bounding boxes are normalized to `[x, y, w, h]` pixel coordinates.
 
 ## Feature Deep Dive
 
@@ -341,10 +420,9 @@ os.environ["HUGGINGFACE_HUB_TOKEN"] = "hf_your_token_here"
 
 # Downloads happen automatically
 dataloader = create_vrsbench_dataloader(
-    images_dir="./data/images",
-    annotations_url="https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/Annotations_val.zip",
-    download_images=True,
-    images_url="https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/Images_val.zip"
+    task="classification",
+    split="validation",
+    download_images=True
 )
 ```
 
@@ -378,8 +456,8 @@ dataloader = create_vrsbench_dataloader(..., config=config)
 **How to use**:
 ```python
 dataloader, metrics = create_vrsbench_dataloader(
-    images_dir="./data/images",
-    annotations_jsonl="./data/annotations.jsonl",
+    task="classification",
+    split="validation",
     return_metrics=True
 )
 
@@ -425,12 +503,13 @@ print(json.dumps(summary, indent=2))
 
 **How to use**:
 ```python
-dataloader = create_vrsbench_dataloader(
-    images_dir="./data/images",
+# Use high-level API for grounding task
+data = prepare_vrsbench_dataset(
+    split="validation",
     task="grounding",
-    region_based=True,  # Extract regions
-    annotations_jsonl="./data/grounding.jsonl"
+    num_samples=1000
 )
+dataloader = create_dataloader_from_prepared(data, batch_size=16)
 
 for images, metas in dataloader:
     # images are cropped regions, not full images
@@ -474,9 +553,8 @@ config = VRSBenchConfig(
 )
 
 dataloader = create_vrsbench_dataloader(
-    images_dir="./data/images",
     task="classification",
-    annotations_jsonl="./data/annotations.jsonl",
+    split="validation",
     config=config
 )
 ```
@@ -494,9 +572,8 @@ custom_transform = transforms.Compose([
 ])
 
 dataloader = create_vrsbench_dataloader(
-    images_dir="./data/images",
     task="classification",
-    annotations_jsonl="./data/annotations.jsonl",
+    split="validation",
     transform=custom_transform
 )
 ```
@@ -514,26 +591,24 @@ dataloader = create_vrsbench_dataloader(
     download_images=True
 )
 
-# Option 2: Pre-load dataset yourself
-dataset = load_dataset("xiang709/VRSBench", streaming=True)
-
-dataloader = create_vrsbench_dataloader(
-    annotations=dataset["validation"],  # Pass HF streaming dataset directly
+# Option 2: Use high-level API for more control
+data = prepare_vrsbench_dataset(
+    split="validation",
     task="classification",
-    download_images=True
+    num_samples=1000
 )
+dataloader = create_dataloader_from_prepared(data, batch_size=16)
 ```
 
 ### Filter by Split
 
 ```python
-# Annotations must have 'split' field
-dataloader = create_vrsbench_dataloader(
-    images_dir="./data/images",
-    annotations_jsonl="./data/all_annotations.jsonl",
+# Split is specified when preparing the dataset
+data = prepare_vrsbench_dataset(
     split="validation",  # Only load validation split
     task="classification"
 )
+dataloader = create_dataloader_from_prepared(data, batch_size=16)
 ```
 
 ## Operational Guardrails
@@ -641,8 +716,7 @@ Convenience wrapper to create PyTorch DataLoader.
 - Calls `prepare_vrsbench_dataset()` to download images and load HuggingFace streaming dataset
 - Calls `create_dataloader_from_prepared()` to create the DataLoader
 
-**Primary workflow**: Uses HuggingFace streaming datasets (recommended).  
-**Legacy fallback**: Supports JSONL files for custom datasets (deprecated).
+**Primary workflow**: Uses HuggingFace streaming datasets.
 
 **Parameters:**
 - `task` (str): Task type - `"classification"`, `"detection"`, `"captioning"`, `"vqa"`, `"grounding"`
@@ -657,8 +731,6 @@ Convenience wrapper to create PyTorch DataLoader.
 - `num_workers` (int): Number of workers (default: 4)
 - `config` (Optional[VRSBenchConfig]): Configuration object
 - `return_metrics` (bool): Return metrics collector (default: False)
-- `annotations_jsonl` (Optional[str]): **Deprecated** - Path to local JSONL file (legacy fallback)
-- `annotations_url` (Optional[str]): **Deprecated** - URL to download annotations (legacy fallback)
 
 **Returns:**
 - `DataLoader` or `(DataLoader, MetricsCollector)` if `return_metrics=True`
@@ -755,9 +827,6 @@ data = prepare_vrsbench_dataset(split="validation", task="vqa", num_samples=1000
 dataloader = create_dataloader_from_prepared(data, batch_size=16)
 ```
 
-### `create_captioning_dataloader_from_prepared()` (Deprecated)
-
-Backward compatibility alias for `create_dataloader_from_prepared()`. Use `create_dataloader_from_prepared()` instead.
 
 ### `VRSBenchConfig`
 
@@ -798,18 +867,16 @@ MIT License
 - ✨ **Unified workflow** - `create_vrsbench_dataloader()` is now a convenience wrapper around the high-level API
 - 🗑️ **Removed redundant code paths** - Eliminated duplicate logic between high-level and low-level APIs
 - 📦 **Consolidated functionality** - All data preparation logic unified under `prepare_vrsbench_dataset()`
-- ⚠️ **Legacy fallback** - JSONL/URL annotation loading moved to deprecated `_create_legacy_dataloader()` function
+- 🗑️ **Removed legacy code** - Eliminated all JSONL/URL annotation loading code paths
 - 🎯 **Streamlined codebase** - Removed ~200 lines of redundant code, improved maintainability
-- 📝 **Clear architecture** - High-level API is primary, legacy code is clearly marked as deprecated
+- 📝 **Clean API surface** - Only current, supported parameters remain. Zero deadweight.
 
 ### Version 2.1.0 (2025-01-13)
 - ✨ **Refactored architecture** - HuggingFace streaming datasets are now the primary workflow
-- ✨ **Simplified API** - `create_vrsbench_dataloader()` automatically loads HF datasets (no JSONL needed)
-- ✨ **Multi-task high-level API** - `prepare_vrsbench_dataset()` works for all tasks, not just captioning
+- ✨ **Simplified API** - `create_vrsbench_dataloader()` automatically loads HF datasets
+- ✨ **Multi-task high-level API** - `prepare_vrsbench_dataset()` works for all tasks
 - ✨ **Renamed function** - `create_dataloader_from_prepared()` replaces captioning-specific name
-- ✨ **Removed legacy code** - Eliminated confusing task-specific file pattern matching
 - ✨ **Consolidated codebase** - Removed duplicate logic, improved maintainability
-- 🔧 **JSONL support** - Now clearly documented as fallback for custom datasets only
 
 ### Version 2.0.0 (2025-01-13)
 - ✨ Multi-task support (classification, detection, captioning, VQA, grounding)
