@@ -38,8 +38,10 @@ from PIL import Image
 import torch
 from torch.utils.data import IterableDataset, DataLoader
 from torchvision import transforms
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import threading
+from multiprocessing import Manager
+import multiprocessing as mp
 
 # Optional dependencies - HuggingFace datasets library
 # This library provides better performance for large datasets and seamless integration
@@ -51,6 +53,16 @@ except ImportError:
     HAS_DATASETS = False
     load_dataset = None
     Dataset = None
+
+# Optional dependencies - Parquet support for faster I/O
+try:
+    import pyarrow.parquet as pq
+    import pyarrow as pa
+    HAS_PARQUET = True
+except ImportError:
+    HAS_PARQUET = False
+    pq = None
+    pa = None
 
 # ========================= Configuration =========================
 
@@ -730,6 +742,117 @@ def _detect_image_directory(base_dir: str) -> str:
     
     return best_dir
 
+# ========================= Parquet Support =========================
+
+def save_to_parquet(data: Dict[str, Any], output_path: str, logger: Optional['StructuredLogger'] = None):
+    """
+    Save prepared dataset to parquet format (10-100x faster than JSON for large datasets).
+    
+    Args:
+        data: Output from prepare_vrsbench_dataset() or prepare_vrsbench_dataset_parallel()
+        output_path: Path to save parquet file (should end with .parquet)
+        logger: Optional logger for messages
+    """
+    if not HAS_PARQUET:
+        raise ImportError(
+            "pyarrow required for parquet support. Install with: pip install pyarrow"
+        )
+    
+    try:
+        import pandas as pd
+        
+        # Convert samples to DataFrame
+        df_samples = pd.DataFrame(data["samples"])
+        
+        # Save samples to parquet
+        df_samples.to_parquet(output_path, compression='snappy', index=False)
+        
+        # Save task-specific mappings and metadata separately (as JSON in parquet metadata or separate files)
+        metadata = {
+            "id_to_path": data.get("id_to_path", {}),
+            "split": data.get("split", ""),
+            "task": data.get("task", ""),
+            "num_samples": data.get("num_samples", 0),
+            "image_to_caption": data.get("image_to_caption", {}),
+            "image_to_label": data.get("image_to_label", {}),
+            "image_to_qa_pairs": data.get("image_to_qa_pairs", {}),
+            "image_to_bboxes": data.get("image_to_bboxes", {})
+        }
+        
+        # Save metadata as JSON alongside parquet
+        metadata_path = output_path.replace('.parquet', '_metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        if logger:
+            logger.info(f"✓ Saved to parquet: {output_path}")
+            logger.info(f"✓ Saved metadata: {metadata_path}")
+        else:
+            print(f"✓ Saved to parquet: {output_path}")
+            print(f"✓ Saved metadata: {metadata_path}")
+            
+    except Exception as e:
+        if logger:
+            logger.error(f"Failed to save parquet: {e}")
+        raise
+
+
+def load_from_parquet(parquet_path: str, logger: Optional['StructuredLogger'] = None) -> Dict[str, Any]:
+    """
+    Load prepared dataset from parquet format.
+    
+    Args:
+        parquet_path: Path to parquet file
+        logger: Optional logger for messages
+    
+    Returns:
+        Dictionary with same structure as prepare_vrsbench_dataset() output
+    """
+    if not HAS_PARQUET:
+        raise ImportError(
+            "pyarrow required for parquet support. Install with: pip install pyarrow"
+        )
+    
+    try:
+        import pandas as pd
+        
+        # Load samples from parquet
+        df_samples = pd.read_parquet(parquet_path)
+        samples = df_samples.to_dict('records')
+        
+        # Load metadata
+        metadata_path = parquet_path.replace('.parquet', '_metadata.json')
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+        else:
+            metadata = {}
+        
+        # Reconstruct data structure
+        data = {
+            "samples": samples,
+            "id_to_path": metadata.get("id_to_path", {}),
+            "split": metadata.get("split", ""),
+            "task": metadata.get("task", ""),
+            "num_samples": metadata.get("num_samples", len(samples)),
+            "image_to_caption": metadata.get("image_to_caption", {}),
+            "image_to_label": metadata.get("image_to_label", {}),
+            "image_to_qa_pairs": metadata.get("image_to_qa_pairs", {}),
+            "image_to_bboxes": metadata.get("image_to_bboxes", {})
+        }
+        
+        if logger:
+            logger.info(f"✓ Loaded from parquet: {parquet_path} ({len(samples)} samples)")
+        else:
+            print(f"✓ Loaded from parquet: {parquet_path} ({len(samples)} samples)")
+        
+        return data
+        
+    except Exception as e:
+        if logger:
+            logger.error(f"Failed to load parquet: {e}")
+        raise
+
 # ========================= DataLoader Factory =========================
 
 def create_vrsbench_dataloader(
@@ -1240,9 +1363,11 @@ def prepare_vrsbench_dataset_parallel(
     download_images: bool = True,
     images_url: Optional[str] = None,
     output_json: Union[Optional[str], bool] = None,
+    output_parquet: Optional[str] = None,
     config: Optional[VRSBenchConfig] = None,
     force_download: bool = False,
-    num_workers: int = 8
+    num_workers: Optional[int] = None,
+    use_multiprocessing: bool = True
 ) -> Dict[str, Any]:
     """
     High-level parallel function to prepare VRSBench dataset for any task.
@@ -1262,7 +1387,8 @@ def prepare_vrsbench_dataset_parallel(
     Performance:
     - 5-10x faster than streaming version for small/medium datasets
     - Best for datasets that fit in memory (< 10GB typically)
-    - Optimal worker count: 4-16 threads (default: 8)
+    - Uses ProcessPoolExecutor for true multi-core parallelism (bypasses Python GIL)
+    - Optimal worker count: os.cpu_count() for CPU-bound, 4-16 for I/O-bound
     
     Args:
         split: Dataset split ("train" or "validation")
@@ -1273,10 +1399,13 @@ def prepare_vrsbench_dataset_parallel(
         hf_token: HuggingFace token (or use HUGGINGFACE_HUB_TOKEN env var)
         download_images: Whether to download images (default: True)
         images_url: Custom URL for images (default: auto-detect from split)
-        output_json: Path to save JSON mapping (optional)
+        output_json: Path to save JSON mapping (optional, or True for auto-filename)
+        output_parquet: Path to save parquet file (optional, 10-100x faster than JSON)
         config: Configuration object (optional)
         force_download: Force re-download even if images exist
-        num_workers: Number of parallel threads (default: 8, optimal for I/O-bound operations)
+        num_workers: Number of parallel workers (default: os.cpu_count() for multiprocessing, 8 for threading)
+        use_multiprocessing: Use ProcessPoolExecutor for true parallelism (default: True)
+                             Set False to use ThreadPoolExecutor (I/O-bound only)
     
     Returns:
         Dictionary with:
@@ -1316,6 +1445,13 @@ def prepare_vrsbench_dataset_parallel(
     # Validate task
     if task not in config.SUPPORTED_TASKS:
         raise ValueError(f"Unsupported task: {task}. Choose from {config.SUPPORTED_TASKS}")
+    
+    # Set optimal worker count if not provided
+    if num_workers is None:
+        if use_multiprocessing:
+            num_workers = os.cpu_count() or 8  # Use all CPU cores for multiprocessing
+        else:
+            num_workers = min(8, (os.cpu_count() or 4) * 2)  # 4-16 for threading
     
     logger = StructuredLogger("VRSBenchWorkflowParallel", config)
     metrics = MetricsCollector()
@@ -1464,14 +1600,14 @@ def prepare_vrsbench_dataset_parallel(
     elif task in ["detection", "grounding"]:
         test_data["image_to_bboxes"] = {}
     
-    # Thread-safe counters
+    # Thread-safe counters (for threading mode)
     count_lock = threading.Lock()
     count = 0
     skipped = 0
     
     def process_single_sample(args):
         """
-        Process a single sample - designed for parallel execution.
+        Process a single sample - designed for parallel execution (threading mode).
         
         This function is thread-safe and processes one sample at a time.
         It extracts image_id, finds corresponding image file, and extracts
@@ -1484,6 +1620,8 @@ def prepare_vrsbench_dataset_parallel(
             Dictionary with sample_info, task_data, and id_to_path, or None if processing failed
         """
         idx, sample = args
+        # Use closure to access local_image_files (works for threading)
+        image_files_dict = local_image_files
         
         try:
             # Try to get image_id or construct one
@@ -1507,10 +1645,10 @@ def prepare_vrsbench_dataset_parallel(
             image_path = None
             
             # Strategy 1: Direct match by image_id (with or without extension)
-            if image_id in local_image_files:
-                image_path = local_image_files[image_id]
-            elif image_id_base in local_image_files:
-                image_path = local_image_files[image_id_base]
+            if image_id in image_files_dict:
+                image_path = image_files_dict[image_id]
+            elif image_id_base in image_files_dict:
+                image_path = image_files_dict[image_id_base]
             else:
                 # Strategy 2: Try common patterns
                 possible_names = [
@@ -1525,13 +1663,13 @@ def prepare_vrsbench_dataset_parallel(
                 ]
                 
                 for name in possible_names:
-                    if name in local_image_files:
-                        image_path = local_image_files[name]
+                    if name in image_files_dict:
+                        image_path = image_files_dict[name]
                         break
                 
                 # Strategy 3: Index-based matching (fallback)
                 if image_path is None:
-                    sorted_files = sorted(local_image_files.items())
+                    sorted_files = sorted(image_files_dict.items())
                     if idx < len(sorted_files):
                         image_path = sorted_files[idx][1]
             
@@ -1606,64 +1744,267 @@ def prepare_vrsbench_dataset_parallel(
             # Log error but don't fail entire batch
             return None
     
-    # Prepare arguments for parallel processing (already have idx from collection)
+    # Create process-safe version for multiprocessing (passes image_files as parameter)
+    def process_single_sample_mp(args):
+        """
+        Process a single sample for multiprocessing (process-safe version).
+        
+        This version accepts image_files_dict as a parameter since processes
+        don't share memory. Used with ProcessPoolExecutor for true parallelism.
+        
+        Args:
+            args: Tuple of (idx, sample, image_files_dict, task, split)
+        
+        Returns:
+            Dictionary with sample_info, task_data, and id_to_path, or None if processing failed
+        """
+        idx, sample, image_files_dict, task_mp, split_mp = args
+        
+        try:
+            # Try to get image_id or construct one
+            image_id = None
+            if 'image_id' in sample:
+                image_id = str(sample['image_id'])
+            elif 'id' in sample:
+                image_id = str(sample['id'])
+            elif 'image_name' in sample:
+                image_id = str(sample['image_name'])
+            elif 'file_name' in sample:
+                image_id = str(sample['file_name'])
+            else:
+                image_id = f"{split_mp}_{idx:05d}"
+            
+            image_id_base = os.path.splitext(image_id)[0]
+            image_path = None
+            
+            # Strategy 1: Direct match
+            if image_id in image_files_dict:
+                image_path = image_files_dict[image_id]
+            elif image_id_base in image_files_dict:
+                image_path = image_files_dict[image_id_base]
+            else:
+                # Strategy 2: Try common patterns
+                possible_names = [
+                    image_id, image_id_base,
+                    f"{image_id}.png", f"{image_id}.jpg", f"{image_id}.jpeg",
+                    f"{image_id_base}.png", f"{image_id_base}.jpg", f"{image_id_base}.jpeg",
+                ]
+                for name in possible_names:
+                    if name in image_files_dict:
+                        image_path = image_files_dict[name]
+                        break
+                
+                # Strategy 3: Index-based fallback
+                if image_path is None:
+                    sorted_files = sorted(image_files_dict.items())
+                    if idx < len(sorted_files):
+                        image_path = sorted_files[idx][1]
+            
+            # File existence check
+            if not image_path or not os.path.exists(image_path):
+                return None
+            
+            # Extract task-specific metadata
+            sample_info = {
+                "image_id": image_id,
+                "image_path": image_path,
+                "dataset_index": idx
+            }
+            
+            task_data = {}
+            
+            # Extract task-specific targets
+            if task_mp == "captioning":
+                caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
+                sample_info["caption"] = caption
+                task_data["image_to_caption"] = {image_id: caption}
+            elif task_mp == "classification":
+                label = None
+                for key in ['label', 'category', 'class', 'target', 'class_id']:
+                    if key in sample:
+                        label = sample[key]
+                        break
+                if label is not None:
+                    sample_info["label"] = label
+                    task_data["image_to_label"] = {image_id: label}
+                else:
+                    return None
+            elif task_mp == "vqa":
+                qa_pairs = sample.get('qa_pairs', [])
+                if qa_pairs:
+                    sample_info["qa_pairs"] = qa_pairs
+                    task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
+                elif 'question' in sample and 'answer' in sample:
+                    qa_pair = [(sample['question'], sample['answer'])]
+                    sample_info["qa_pairs"] = qa_pair
+                    task_data["image_to_qa_pairs"] = {image_id: qa_pair}
+                else:
+                    return None
+            elif task_mp in ["detection", "grounding"]:
+                bboxes = []
+                if 'bbox' in sample:
+                    bboxes = [sample['bbox']]
+                elif 'bboxes' in sample:
+                    bboxes = sample['bboxes']
+                elif 'objects' in sample:
+                    bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+                if bboxes:
+                    sample_info["bboxes"] = bboxes
+                    task_data["image_to_bboxes"] = {image_id: bboxes}
+                else:
+                    return None
+            
+            # Add all other fields
+            for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
+                       'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
+                if key in sample and key not in sample_info:
+                    sample_info[key] = sample[key]
+            
+            return {
+                "sample_info": sample_info,
+                "task_data": task_data,
+                "id_to_path": {image_id: image_path}
+            }
+            
+        except Exception as e:
+            return None
+    
+    # Prepare arguments for parallel processing
     args_list = all_samples  # Already in (idx, sample) format
     
-    # Process in parallel using ThreadPoolExecutor
-    logger.info(f"Starting parallel processing with {num_workers} workers...")
-    start_time = time.time()
-    
-    # Create progress bar for parallel processing
-    pbar = tqdm(total=len(args_list), desc=f"Processing samples ({task})", disable=config.LOG_LEVEL == "ERROR")
-    
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Submit all tasks (args_list already contains (idx, sample) tuples)
-        future_to_args = {executor.submit(process_single_sample, args): args for args in args_list}
+    # Process in parallel using ProcessPoolExecutor or ThreadPoolExecutor
+    # Note: On Windows, multiprocessing requires if __name__ == "__main__" guard
+    # For better compatibility, we check if we're in main or if multiprocessing is safe
+    if use_multiprocessing and num_workers > 1:
+        # Set multiprocessing start method (if not already set)
+        # Use 'fork' on Linux (faster) and 'spawn' on Windows (required)
+        try:
+            if sys.platform == 'win32':
+                mp.set_start_method('spawn', force=False)  # Required on Windows
+            else:
+                # On Linux/Unix, 'fork' is default and faster, but try to set it explicitly
+                try:
+                    mp.set_start_method('fork', force=False)
+                except RuntimeError:
+                    # Already set, ignore
+                    pass
+        except RuntimeError:
+            # Already set, ignore
+            pass
+        logger.info(f"Using ProcessPoolExecutor with {num_workers} processes for true multi-core parallelism")
+        start_time = time.time()
         
-        # Collect results as they complete
-        completed = 0
-        for future in as_completed(future_to_args):
-            completed += 1
-            result = future.result()
+        # Create progress bar
+        pbar = tqdm(total=len(args_list), desc=f"Processing samples ({task})", disable=config.LOG_LEVEL == "ERROR")
+        
+        # For multiprocessing, we need to pass image_files as parameter
+        # Note: Passing a copy of the dict to each process (memory trade-off for speed)
+        # For very large image file dicts, consider using Manager().dict() but it's slower
+        image_files_copy = dict(local_image_files)  # Create once, reuse for all processes
+        args_list_mp = [(idx, sample, image_files_copy, task, split) 
+                       for idx, sample in args_list]
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_args = {executor.submit(process_single_sample_mp, args): args for args in args_list_mp}
             
-            with count_lock:
-                if result:
-                    test_data["samples"].append(result["sample_info"])
-                    test_data["id_to_path"].update(result["id_to_path"])
-                    
-                    # Update task-specific mappings
-                    if "image_to_caption" in result["task_data"]:
-                        test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
-                    elif "image_to_label" in result["task_data"]:
-                        test_data["image_to_label"].update(result["task_data"]["image_to_label"])
-                    elif "image_to_qa_pairs" in result["task_data"]:
-                        test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
-                    elif "image_to_bboxes" in result["task_data"]:
-                        test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
-                    
-                    count += 1
-                else:
-                    skipped += 1
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(future_to_args):
+                completed += 1
+                result = future.result()
                 
-                # Update progress bar
-                elapsed = time.time() - start_time
-                rate = count / elapsed if elapsed > 0 else 0
-                pbar.update(1)
-                pbar.set_postfix({
-                    "processed": count,
-                    "skipped": skipped,
-                    "rate": f"{rate:.1f}/s"
-                })
+                with count_lock:
+                    if result:
+                        test_data["samples"].append(result["sample_info"])
+                        test_data["id_to_path"].update(result["id_to_path"])
+                        
+                        # Update task-specific mappings
+                        if "image_to_caption" in result["task_data"]:
+                            test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
+                        elif "image_to_label" in result["task_data"]:
+                            test_data["image_to_label"].update(result["task_data"]["image_to_label"])
+                        elif "image_to_qa_pairs" in result["task_data"]:
+                            test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
+                        elif "image_to_bboxes" in result["task_data"]:
+                            test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
+                        
+                        count += 1
+                    else:
+                        skipped += 1
+                    
+                    # Update progress bar
+                    elapsed = time.time() - start_time
+                    rate = count / elapsed if elapsed > 0 else 0
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        "processed": count,
+                        "skipped": skipped,
+                        "rate": f"{rate:.1f}/s"
+                    })
+                    
+                    # Progress logging (every 500 samples)
+                    if count % 500 == 0:
+                        logger.info(f"✓ [{count}/{len(all_samples)}] Processed samples... ({rate:.1f} samples/sec)")
+        
+        pbar.close()
+        
+    else:
+        # Use ThreadPoolExecutor for I/O-bound operations or when multiprocessing disabled
+        logger.info(f"Using ThreadPoolExecutor with {num_workers} threads (I/O-bound mode)")
+        start_time = time.time()
+        
+        # Create progress bar
+        pbar = tqdm(total=len(args_list), desc=f"Processing samples ({task})", disable=config.LOG_LEVEL == "ERROR")
+        
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks (args_list already contains (idx, sample) tuples)
+            future_to_args = {executor.submit(process_single_sample, args): args for args in args_list}
+            
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(future_to_args):
+                completed += 1
+                result = future.result()
                 
-                # Progress logging (every 500 samples)
-                if count % 500 == 0:
-                    logger.info(f"✓ [{count}/{len(all_samples)}] Processed samples... ({rate:.1f} samples/sec)")
+                with count_lock:
+                    if result:
+                        test_data["samples"].append(result["sample_info"])
+                        test_data["id_to_path"].update(result["id_to_path"])
+                        
+                        # Update task-specific mappings
+                        if "image_to_caption" in result["task_data"]:
+                            test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
+                        elif "image_to_label" in result["task_data"]:
+                            test_data["image_to_label"].update(result["task_data"]["image_to_label"])
+                        elif "image_to_qa_pairs" in result["task_data"]:
+                            test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
+                        elif "image_to_bboxes" in result["task_data"]:
+                            test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
+                        
+                        count += 1
+                    else:
+                        skipped += 1
+                    
+                    # Update progress bar
+                    elapsed = time.time() - start_time
+                    rate = count / elapsed if elapsed > 0 else 0
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        "processed": count,
+                        "skipped": skipped,
+                        "rate": f"{rate:.1f}/s"
+                    })
+                    
+                    # Progress logging (every 500 samples)
+                    if count % 500 == 0:
+                        logger.info(f"✓ [{count}/{len(all_samples)}] Processed samples... ({rate:.1f} samples/sec)")
+        
+        pbar.close()
     
-    pbar.close()
-    
-    test_data["num_samples"] = count
-    
+    # Calculate final elapsed time (start_time was set in both branches)
     elapsed = time.time() - start_time
+    test_data["num_samples"] = count
     rate = count / elapsed if elapsed > 0 else 0
     logger.info(f"✓ Created dataset with {count} samples (skipped {skipped}) in {elapsed:.2f}s ({rate:.1f} samples/sec)")
     
@@ -1671,6 +2012,15 @@ def prepare_vrsbench_dataset_parallel(
     metrics.record_time("parallel_preparation", elapsed)
     metrics.increment("samples_processed", count)
     metrics.increment("samples_skipped", skipped)
+    
+    # Save to parquet if requested (faster than JSON)
+    if output_parquet:
+        try:
+            save_to_parquet(test_data, output_parquet, logger)
+        except ImportError:
+            logger.warning("pyarrow not available, falling back to JSON")
+            if not output_json:
+                output_json = output_parquet.replace('.parquet', '.json')
     
     # Save to JSON if requested
     if output_json:
