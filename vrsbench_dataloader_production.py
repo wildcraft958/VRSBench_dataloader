@@ -1037,146 +1037,167 @@ def prepare_vrsbench_dataset(
     skipped = 0
     
     # Get list of local image files for matching
+    logger.info(f"Building image file index...")
     local_image_files = {}
     if os.path.exists(images_dir):
+        # Collect all image files first for progress tracking
+        all_image_files = []
         for root, dirs, files in os.walk(images_dir):
             # Skip hidden dirs and macOS metadata
             dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__MACOSX']
             for file in files:
                 if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    file_path = os.path.join(root, file)
-                    # Store by basename for easy lookup
-                    basename = os.path.basename(file)
-                    # Remove extension for matching
-                    name_without_ext = os.path.splitext(basename)[0]
-                    local_image_files[name_without_ext] = file_path
-                    # Also store with full basename
-                    local_image_files[basename] = file_path
+                    all_image_files.append((root, file))
+        
+        # Index files with progress bar
+        for root, file in tqdm(all_image_files, desc="Indexing image files", disable=config.LOG_LEVEL == "ERROR"):
+            file_path = os.path.join(root, file)
+            # Store by basename for easy lookup
+            basename = os.path.basename(file)
+            # Remove extension for matching
+            name_without_ext = os.path.splitext(basename)[0]
+            local_image_files[name_without_ext] = file_path
+            # Also store with full basename
+            local_image_files[basename] = file_path
     
     logger.info(f"Found {len(local_image_files)} local image files")
     
-    for idx, sample in enumerate(dataset_iterator):
-        if num_samples and count >= num_samples:
-            break
-        
-        try:
-            # Try to get image_id or construct one
-            image_id = None
-            if 'image_id' in sample:
-                image_id = str(sample['image_id'])
-            elif 'id' in sample:
-                image_id = str(sample['id'])
-            elif 'image_name' in sample:
-                image_id = str(sample['image_name'])
-            elif 'file_name' in sample:
-                image_id = str(sample['file_name'])
-            else:
-                # Construct from index
-                image_id = f"{split}_{idx:05d}"
+    # Create progress bar for sample processing
+    progress_desc = f"Processing {split} samples ({task})"
+    if num_samples:
+        pbar = tqdm(total=num_samples, desc=progress_desc, disable=config.LOG_LEVEL == "ERROR")
+    else:
+        pbar = tqdm(desc=progress_desc, disable=config.LOG_LEVEL == "ERROR")
+    
+    try:
+        for idx, sample in enumerate(dataset_iterator):
+            if num_samples and count >= num_samples:
+                break
             
-            # Remove extension from image_id for matching
-            image_id_base = os.path.splitext(image_id)[0]
-            
-            # Find corresponding local image file
-            image_path = None
-            
-            # Strategy 1: Direct match by image_id (with or without extension)
-            if image_id in local_image_files:
-                image_path = local_image_files[image_id]
-            elif image_id_base in local_image_files:
-                image_path = local_image_files[image_id_base]
-            else:
-                # Strategy 2: Try common patterns
-                possible_names = [
-                    image_id,
-                    image_id_base,
-                    f"{image_id}.png",
-                    f"{image_id}.jpg",
-                    f"{image_id}.jpeg",
-                    f"{image_id_base}.png",
-                    f"{image_id_base}.jpg",
-                    f"{image_id_base}.jpeg",
-                ]
+            try:
+                # Try to get image_id or construct one
+                image_id = None
+                if 'image_id' in sample:
+                    image_id = str(sample['image_id'])
+                elif 'id' in sample:
+                    image_id = str(sample['id'])
+                elif 'image_name' in sample:
+                    image_id = str(sample['image_name'])
+                elif 'file_name' in sample:
+                    image_id = str(sample['file_name'])
+                else:
+                    # Construct from index
+                    image_id = f"{split}_{idx:05d}"
                 
-                for name in possible_names:
-                    if name in local_image_files:
-                        image_path = local_image_files[name]
-                        break
+                # Remove extension from image_id for matching
+                image_id_base = os.path.splitext(image_id)[0]
                 
-                # Strategy 3: Index-based matching (fallback)
-                if image_path is None:
-                    sorted_files = sorted(local_image_files.items())
-                    if idx < len(sorted_files):
-                        image_path = sorted_files[idx][1]
-            
-            if image_path and os.path.exists(image_path):
-                # Store path mapping
-                test_data["id_to_path"][image_id] = image_path
+                # Find corresponding local image file
+                image_path = None
                 
-                # Extract task-specific metadata
-                sample_info = {
-                    "image_id": image_id,
-                    "image_path": image_path,
-                    "dataset_index": idx
-                }
-                
-                # Extract task-specific targets
-                if task == "captioning":
-                    caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
-                    sample_info["caption"] = caption
-                    test_data["image_to_caption"][image_id] = caption
-                elif task == "classification":
-                    # Try to find label
-                    label = None
-                    for key in ['label', 'category', 'class', 'target', 'class_id']:
-                        if key in sample:
-                            label = sample[key]
+                # Strategy 1: Direct match by image_id (with or without extension)
+                if image_id in local_image_files:
+                    image_path = local_image_files[image_id]
+                elif image_id_base in local_image_files:
+                    image_path = local_image_files[image_id_base]
+                else:
+                    # Strategy 2: Try common patterns
+                    possible_names = [
+                        image_id,
+                        image_id_base,
+                        f"{image_id}.png",
+                        f"{image_id}.jpg",
+                        f"{image_id}.jpeg",
+                        f"{image_id_base}.png",
+                        f"{image_id_base}.jpg",
+                        f"{image_id_base}.jpeg",
+                    ]
+                    
+                    for name in possible_names:
+                        if name in local_image_files:
+                            image_path = local_image_files[name]
                             break
-                    if label is not None:
-                        sample_info["label"] = label
-                        test_data["image_to_label"][image_id] = label
-                elif task == "vqa":
-                    qa_pairs = sample.get('qa_pairs', [])
-                    if qa_pairs:
-                        sample_info["qa_pairs"] = qa_pairs
-                        test_data["image_to_qa_pairs"][image_id] = qa_pairs
-                    elif 'question' in sample and 'answer' in sample:
-                        qa_pair = [(sample['question'], sample['answer'])]
-                        sample_info["qa_pairs"] = qa_pair
-                        test_data["image_to_qa_pairs"][image_id] = qa_pair
-                elif task in ["detection", "grounding"]:
-                    bboxes = []
-                    if 'bbox' in sample:
-                        bboxes = [sample['bbox']]
-                    elif 'bboxes' in sample:
-                        bboxes = sample['bboxes']
-                    elif 'objects' in sample:
-                        bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
-                    if bboxes:
-                        sample_info["bboxes"] = bboxes
-                        test_data["image_to_bboxes"][image_id] = bboxes
+                    
+                    # Strategy 3: Index-based matching (fallback)
+                    if image_path is None:
+                        sorted_files = sorted(local_image_files.items())
+                        if idx < len(sorted_files):
+                            image_path = sorted_files[idx][1]
                 
-                # Add all other fields from dataset
-                for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
-                           'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
-                    if key in sample and key not in sample_info:
-                        sample_info[key] = sample[key]
-                
-                test_data["samples"].append(sample_info)
-                
-                count += 1
-                if count % 100 == 0:
-                    logger.info(f"✓ [{count}/{num_samples if num_samples else 'all'}] Processed samples...")
-            else:
+                if image_path and os.path.exists(image_path):
+                    # Store path mapping
+                    test_data["id_to_path"][image_id] = image_path
+                    
+                    # Extract task-specific metadata
+                    sample_info = {
+                        "image_id": image_id,
+                        "image_path": image_path,
+                        "dataset_index": idx
+                    }
+                    
+                    # Extract task-specific targets
+                    if task == "captioning":
+                        caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
+                        sample_info["caption"] = caption
+                        test_data["image_to_caption"][image_id] = caption
+                    elif task == "classification":
+                        # Try to find label
+                        label = None
+                        for key in ['label', 'category', 'class', 'target', 'class_id']:
+                            if key in sample:
+                                label = sample[key]
+                                break
+                        if label is not None:
+                            sample_info["label"] = label
+                            test_data["image_to_label"][image_id] = label
+                    elif task == "vqa":
+                        qa_pairs = sample.get('qa_pairs', [])
+                        if qa_pairs:
+                            sample_info["qa_pairs"] = qa_pairs
+                            test_data["image_to_qa_pairs"][image_id] = qa_pairs
+                        elif 'question' in sample and 'answer' in sample:
+                            qa_pair = [(sample['question'], sample['answer'])]
+                            sample_info["qa_pairs"] = qa_pair
+                            test_data["image_to_qa_pairs"][image_id] = qa_pair
+                    elif task in ["detection", "grounding"]:
+                        bboxes = []
+                        if 'bbox' in sample:
+                            bboxes = [sample['bbox']]
+                        elif 'bboxes' in sample:
+                            bboxes = sample['bboxes']
+                        elif 'objects' in sample:
+                            bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+                        if bboxes:
+                            sample_info["bboxes"] = bboxes
+                            test_data["image_to_bboxes"][image_id] = bboxes
+                    
+                    # Add all other fields from dataset
+                    for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
+                               'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
+                        if key in sample and key not in sample_info:
+                            sample_info[key] = sample[key]
+                    
+                    test_data["samples"].append(sample_info)
+                    
+                    count += 1
+                    pbar.update(1)
+                    pbar.set_postfix({"processed": count, "skipped": skipped})
+                    if count % 100 == 0:
+                        logger.info(f"✓ [{count}/{num_samples if num_samples else 'all'}] Processed samples...")
+                else:
+                    skipped += 1
+                    pbar.set_postfix({"processed": count, "skipped": skipped})
+                    if skipped <= 10:
+                        logger.warning(f"⚠ Skipped sample {idx}: Image not found for image_id={image_id}")
+                    
+            except Exception as e:
                 skipped += 1
+                pbar.set_postfix({"processed": count, "skipped": skipped})
                 if skipped <= 10:
-                    logger.warning(f"⚠ Skipped sample {idx}: Image not found for image_id={image_id}")
-                
-        except Exception as e:
-            skipped += 1
-            if skipped <= 10:
-                logger.warning(f"⚠ Error processing sample {idx}: {e}")
-            continue
+                    logger.warning(f"⚠ Error processing sample {idx}: {e}")
+                continue
+    finally:
+        pbar.close()
     
     test_data["num_samples"] = count
     
@@ -1336,19 +1357,25 @@ def prepare_vrsbench_dataset_parallel(
     logger.info(f"Building image file index...")
     local_image_files = {}
     if os.path.exists(images_dir):
+        # Collect all image files first for progress tracking
+        all_image_files = []
         for root, dirs, files in os.walk(images_dir):
             # Skip hidden dirs and macOS metadata
             dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__MACOSX']
             for file in files:
                 if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    file_path = os.path.join(root, file)
-                    # Store by basename for easy lookup
-                    basename = os.path.basename(file)
-                    # Remove extension for matching
-                    name_without_ext = os.path.splitext(basename)[0]
-                    local_image_files[name_without_ext] = file_path
-                    # Also store with full basename
-                    local_image_files[basename] = file_path
+                    all_image_files.append((root, file))
+        
+        # Index files with progress bar
+        for root, file in tqdm(all_image_files, desc="Indexing image files", disable=config.LOG_LEVEL == "ERROR"):
+            file_path = os.path.join(root, file)
+            # Store by basename for easy lookup
+            basename = os.path.basename(file)
+            # Remove extension for matching
+            name_without_ext = os.path.splitext(basename)[0]
+            local_image_files[name_without_ext] = file_path
+            # Also store with full basename
+            local_image_files[basename] = file_path
     
     logger.info(f"Found {len(local_image_files)} local image files")
     
@@ -1371,7 +1398,10 @@ def prepare_vrsbench_dataset_parallel(
     
     # Convert to list for parallel processing
     dataset_split = hf_dataset[split]
-    all_samples = list(dataset_split)
+    logger.info(f"Converting dataset to list for parallel processing...")
+    all_samples = []
+    for sample in tqdm(dataset_split, desc="Loading dataset", disable=config.LOG_LEVEL == "ERROR"):
+        all_samples.append(sample)
     
     # Limit samples if requested
     if num_samples:
@@ -1547,6 +1577,9 @@ def prepare_vrsbench_dataset_parallel(
     logger.info(f"Starting parallel processing with {num_workers} workers...")
     start_time = time.time()
     
+    # Create progress bar for parallel processing
+    pbar = tqdm(total=len(args_list), desc=f"Processing samples ({task})", disable=config.LOG_LEVEL == "ERROR")
+    
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         # Submit all tasks
         future_to_idx = {executor.submit(process_single_sample, args): idx for idx, args in enumerate(args_list)}
@@ -1576,15 +1609,21 @@ def prepare_vrsbench_dataset_parallel(
                 else:
                     skipped += 1
                 
+                # Update progress bar
+                elapsed = time.time() - start_time
+                rate = count / elapsed if elapsed > 0 else 0
+                pbar.update(1)
+                pbar.set_postfix({
+                    "processed": count,
+                    "skipped": skipped,
+                    "rate": f"{rate:.1f}/s"
+                })
+                
                 # Progress logging (every 500 samples)
                 if count % 500 == 0:
-                    elapsed = time.time() - start_time
-                    rate = count / elapsed if elapsed > 0 else 0
                     logger.info(f"✓ [{count}/{len(all_samples)}] Processed samples... ({rate:.1f} samples/sec)")
-            
-            # Batch progress (every 1000 tasks)
-            if completed % 1000 == 0:
-                logger.info(f"Completed {completed}/{len(args_list)} tasks...")
+    
+    pbar.close()
     
     test_data["num_samples"] = count
     
