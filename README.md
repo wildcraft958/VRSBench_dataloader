@@ -44,6 +44,10 @@ This loader eliminates all of that. **One function call replaces 50+ lines of bo
 
 **Production Guardrails**: Exception handling with detailed error context. Automatic image path resolution (absolute, relative, basename search). Graceful degradation when optional dependencies missing. Robust error handling for dataset parsing errors (ArrowInvalid, type inconsistencies) - automatically skips problematic samples and continues processing.
 
+**Resilient Streaming + Local Fallback**: A shared `_resilient_sample_generator` keeps HuggingFace streaming as the primary path but automatically switches to cached annotation zips whenever JSON parsing blows up or `datasets` is unavailable. Samples are normalized on-the-fly (e.g., mixed `ques_id` dtypes) and deduped so the pipeline keeps moving instead of crashing.
+
+**Incremental Checkpoints**: Long-running extractions now save JSON snapshots every `config.CHECKPOINT_EVERY_SAMPLES` (and on completion) into `config.CHECKPOINT_DIR`, and the parallel path exposes `checkpoint_dir`/`checkpoint_every` knobs. If a run is interrupted you can resume from the latest snapshot instead of starting from zero.
+
 ## Installation
 
 ```bash
@@ -399,6 +403,52 @@ data = prepare_vrsbench_dataset_parallel(
     num_workers=8
 )
 ```
+
+### Progress Checkpointing & Resume
+
+Every preparation function now writes periodic JSON snapshots so long jobs are never lost. Control the cadence via config or per-call overrides:
+
+```python
+from vrsbench_dataloader_production import VRSBenchConfig, prepare_vrsbench_dataset, prepare_vrsbench_dataset_parallel
+
+# Streaming mode: configure once
+config = VRSBenchConfig(
+    CHECKPOINT_DIR="./checkpoints",
+    CHECKPOINT_EVERY_SAMPLES=250
+)
+stream_data = prepare_vrsbench_dataset(
+    split="validation",
+    task="vqa",
+    config=config
+)
+
+# Parallel mode: override per call
+parallel_data = prepare_vrsbench_dataset_parallel(
+    split="validation",
+    task="captioning",
+    checkpoint_dir="./checkpoints",
+    checkpoint_every=500,
+    num_workers=8
+)
+```
+
+When a run restarts it automatically continues collecting new samples; you can also load the latest checkpoint JSON manually if you need to inspect progress.
+
+### Controlling the Annotation Fallback
+
+The resilient loader falls back to local annotation zips whenever HuggingFace streaming raises repeated ArrowInvalid errors or when `datasets` is unavailable. Override where the archive is stored or fetched:
+
+```python
+data = prepare_vrsbench_dataset_parallel(
+    split="validation",
+    task="captioning",
+    annotations_dir="./cache/annotations",
+    annotations_url="https://example.com/custom_annotations.zip",
+    num_workers=8
+)
+```
+
+The helper automatically downloads the zip (with retries), caches it under `annotations_dir`, and iterates the JSON payload while normalizing known schema quirks (e.g., mixed `ques_id` types).
 
 ### Custom Image Transforms
 
@@ -830,6 +880,13 @@ If you use this dataloader or VRSBench dataset, please cite:
 MIT License
 
 ## Changelog
+
+### Version 3.3.0 (2025-01-16) - Resilient Streaming & Checkpoints
+- 🛡️ **Resilient Sample Generator** – Unified HuggingFace streamer with automatic fallback to cached annotation zips, plus on-the-fly normalization of inconsistent records (e.g., mixed `ques_id` types) to eliminate ArrowInvalid crashes.
+- 🔁 **Duplicate & Error Tracking** – Deterministic sample keys prevent duplicated metadata and surface precise skip counts for transparency.
+- 💾 **Incremental Checkpointing** – Streaming and parallel flows now write periodic JSON snapshots (configurable via `CHECKPOINT_EVERY_SAMPLES` or per-call overrides) and always finalize a checkpoint on exit.
+- ⚙️ **Configurable Fallback Paths** – Parallel API exposes `annotations_dir` / `annotations_url` controls for air-gapped or custom annotation sources.
+- 📘 **Documentation Updates** – README sections covering checkpointing, fallback controls, and API docstrings describing the new parameters.
 
 ### Version 3.2.0 (2025-01-15) - Image Matching Fix & Complete Task Mode
 - 🐛 **Fixed Image Matching Bug** - Now properly extracts image IDs from dataset's `'image'` field (PIL Image objects, string paths, or dict formats)

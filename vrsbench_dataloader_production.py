@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 vrsbench_dataloader_production.py
 
@@ -26,6 +28,7 @@ import sys
 import time
 import json
 import zipfile
+import io
 from pathlib import Path
 from dataclasses import dataclass
 from collections import defaultdict
@@ -84,6 +87,8 @@ class VRSBenchConfig:
     # These are the official HuggingFace dataset URLs for VRSBench
     # Using /resolve/main/ ensures we get the actual files, not the git repository
     IMAGES_URL: str = "https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/images.zip"
+    ANNOTATIONS_TRAIN_URL: str = "https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/Annotations_train.zip"
+    ANNOTATIONS_VAL_URL: str = "https://huggingface.co/datasets/xiang709/VRSBench/resolve/main/Annotations_val.zip"
 
     # Download settings
     MAX_RETRIES: int = 5  # Number of retry attempts for failed downloads
@@ -114,6 +119,13 @@ class VRSBenchConfig:
     PIN_MEMORY: bool = True  # Pin memory for faster GPU transfer (only useful with GPU)
     PREFETCH_FACTOR: int = 2  # Number of batches to prefetch per worker (reduces idle time)
 
+    # Checkpointing / fault-tolerance
+    CHECKPOINT_DIR: str = "./checkpoints"
+    CHECKPOINT_EVERY_SAMPLES: int = 1000  # Persist progress after every N processed samples
+
+    # HuggingFace streaming fault tolerance
+    HF_MAX_CONSECUTIVE_PARSE_ERRORS: int = 5
+
     # Task-specific settings
     SUPPORTED_TASKS: List[str] = None  # Will be set in __post_init__
 
@@ -133,7 +145,10 @@ class VRSBenchConfig:
         # Skip log directory creation if it's /dev/null (Colab workaround)
         if self.LOG_DIR != "/dev/null":
             os.makedirs(self.LOG_DIR, exist_ok=True)
-        os.makedirs(self.CACHE_DIR, exist_ok=True)
+        if self.CACHE_DIR:
+            os.makedirs(self.CACHE_DIR, exist_ok=True)
+        if self.CHECKPOINT_DIR:
+            os.makedirs(self.CHECKPOINT_DIR, exist_ok=True)
 
 # ========================= Logging Setup =========================
 
@@ -164,9 +179,6 @@ class StructuredLogger:
         self.logger.setLevel(getattr(logging, config.LOG_LEVEL.upper()))
         # Prevent propagation to root logger to avoid duplicate logs
         self.logger.propagate = False
-
-        # Remove existing handlers to avoid duplicates if logger is reused
-        self.logger.handlers.clear()
 
         # Console handler - outputs to stdout for immediate visibility
         # Set to INFO level to avoid cluttering console with DEBUG messages
@@ -325,6 +337,284 @@ class MetricsCollector:
         self.metrics.clear()
         self.timings.clear()
         self.errors.clear()
+
+
+def _json_default(value):
+    """Best-effort JSON serializer for objects that default json can't handle."""
+    if isinstance(value, (set, tuple)):
+        return list(value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.decode("latin-1", errors="ignore")
+    return str(value)
+
+
+class ProgressCheckpointWriter:
+    """Incrementally persists processed dataset snapshots to avoid losing work."""
+
+    def __init__(
+        self,
+        enabled: bool,
+        checkpoint_dir: str,
+        split: str,
+        task: str,
+        every: int,
+        logger: StructuredLogger,
+    ):
+        self.enabled = enabled and every is not None and every > 0
+        self.every = every if every else 0
+        self.logger = logger
+        self.prefix = f"{split}_{task.replace('/', '_')}"
+        self.last_checkpoint_count = 0
+        self.checkpoint_dir = checkpoint_dir
+        if self.enabled:
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+    def maybe_checkpoint(self, data: Dict[str, Any], processed_count: int):
+        if not self.enabled or processed_count - self.last_checkpoint_count < self.every:
+            return
+        file_name = f"{self.prefix}_progress_{processed_count:06d}.json"
+        self._write_snapshot(data, file_name)
+        self.last_checkpoint_count = processed_count
+
+    def finalize(self, data: Dict[str, Any]):
+        if not self.enabled:
+            return
+        file_name = f"{self.prefix}_final.json"
+        self._write_snapshot(data, file_name)
+
+    def _write_snapshot(self, data: Dict[str, Any], file_name: str):
+        path = os.path.join(self.checkpoint_dir, file_name)
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(data, f, indent=2, default=_json_default)
+            os.replace(tmp_path, path)
+            self.logger.debug(f"Checkpoint persisted: {path}")
+        except Exception as exc:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            self.logger.warning(f"Failed to write checkpoint {path}: {exc}")
+
+
+def _normalize_sample_for_consistency(sample: Any) -> Any:
+    """Normalize known inconsistent fields (e.g., ques_id types) in-place."""
+    if not isinstance(sample, dict):
+        return sample
+
+    if "qa_pairs" in sample and isinstance(sample["qa_pairs"], list):
+        normalized_pairs = []
+        for qa in sample["qa_pairs"]:
+            if not isinstance(qa, dict):
+                continue
+            qa_copy = dict(qa)
+            if "ques_id" in qa_copy and qa_copy["ques_id"] is not None:
+                qa_copy["ques_id"] = str(qa_copy["ques_id"])
+            normalized_pairs.append(qa_copy)
+        sample["qa_pairs"] = normalized_pairs
+
+    if "image_id" in sample and sample["image_id"] is not None:
+        sample["image_id"] = str(sample["image_id"])
+
+    return sample
+
+
+def _extract_sample_key(sample: Dict[str, Any], idx: int, split: str) -> str:
+    """Derive a deterministic key for deduplicating samples."""
+    candidate_keys = [
+        sample.get("image_id"),
+        sample.get("image_name"),
+        sample.get("file_name"),
+        sample.get("id"),
+    ]
+
+    image_field = sample.get("image")
+    if isinstance(image_field, dict):
+        candidate_keys.append(image_field.get("path"))
+        candidate_keys.append(image_field.get("filename"))
+    elif isinstance(image_field, str):
+        candidate_keys.append(image_field)
+
+    for key in candidate_keys:
+        if key:
+            return str(key)
+    return f"{split}_{idx:06d}"
+
+
+def _ensure_annotations_zip(
+    split: str,
+    annotations_dir: Optional[str],
+    annotations_url: Optional[str],
+    config: VRSBenchConfig,
+    download_mgr: DownloadManager,
+    logger: StructuredLogger,
+    force_download: bool = False,
+) -> Optional[str]:
+    """Download annotations zip if needed and return path."""
+    if annotations_dir is None:
+        annotations_dir = f"./Annotations_{split}"
+    os.makedirs(annotations_dir, exist_ok=True)
+
+    if annotations_url is None:
+        if split == "validation":
+            annotations_url = config.ANNOTATIONS_VAL_URL
+        elif split == "train":
+            annotations_url = config.ANNOTATIONS_TRAIN_URL
+        else:
+            logger.warning(f"Unknown split '{split}' for annotations fallback; cannot download")
+            return None
+
+    zip_name = os.path.basename(annotations_url)
+    zip_path = os.path.join(annotations_dir, zip_name)
+
+    should_download = force_download or not os.path.exists(zip_path) or os.path.getsize(zip_path) < 1024
+    if should_download:
+        logger.info(f"Downloading annotations for {split} split...")
+        download_mgr.download_with_retries(annotations_url, zip_path, force=force_download)
+
+    if not os.path.exists(zip_path):
+        logger.error(f"Annotations zip not found at {zip_path}")
+        return None
+
+    return zip_path
+
+
+def _iterate_annotations_from_zip(
+    zip_path: str,
+    logger: StructuredLogger,
+    stats: Optional[Dict[str, int]] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Yield samples from a local annotations zip, normalizing inconsistencies."""
+    if not zip_path or not os.path.exists(zip_path):
+        logger.error(f"Cannot iterate annotations from missing zip: {zip_path}")
+        return iter(())
+
+    def _iter() -> Iterator[Dict[str, Any]]:
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                json_files = [name for name in zf.namelist() if name.lower().endswith(".json")]
+                if not json_files:
+                    logger.warning(f"No JSON files found inside {zip_path}")
+                for member in json_files:
+                    try:
+                        with zf.open(member, "r") as fh:
+                            text = io.TextIOWrapper(fh, encoding="utf-8")
+                            data = json.load(text)
+                    except json.JSONDecodeError as exc:
+                        logger.warning(f"Failed to parse {member} in {zip_path}: {exc}")
+                        if stats is not None:
+                            stats["annotation_parse_errors"] = stats.get("annotation_parse_errors", 0) + 1
+                        continue
+                    except Exception as exc:
+                        logger.warning(f"Failed to read {member} in {zip_path}: {exc}")
+                        if stats is not None:
+                            stats["annotation_read_errors"] = stats.get("annotation_read_errors", 0) + 1
+                        continue
+
+                    if isinstance(data, list):
+                        for entry in data:
+                            yield _normalize_sample_for_consistency(entry)
+                    elif isinstance(data, dict):
+                        annotations = data.get("annotations")
+                        if isinstance(annotations, list):
+                            metadata = {k: v for k, v in data.items() if k != "annotations"}
+                            for entry in annotations:
+                                combined = dict(metadata)
+                                combined.update(entry if isinstance(entry, dict) else {})
+                                yield _normalize_sample_for_consistency(combined)
+                        else:
+                            yield _normalize_sample_for_consistency(data)
+                    else:
+                        logger.warning(f"Unsupported JSON structure in {member}: {type(data)}")
+        except zipfile.BadZipFile as exc:
+            logger.error(f"Annotations zip {zip_path} is corrupted: {exc}")
+            if stats is not None:
+                stats["annotation_bad_zip"] = stats.get("annotation_bad_zip", 0) + 1
+
+    return _iter()
+
+
+def _resilient_sample_generator(
+    split: str,
+    hf_dataset_name: str,
+    hf_token: Optional[str],
+    logger: StructuredLogger,
+    config: VRSBenchConfig,
+    download_mgr: DownloadManager,
+    annotations_dir: Optional[str],
+    annotations_url: Optional[str],
+    force_download: bool = False,
+    stats: Optional[Dict[str, int]] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Yield samples from HuggingFace streaming dataset with automatic fallback."""
+    hf_iterator: Optional[Iterator[Dict[str, Any]]] = None
+    if HAS_DATASETS:
+        if hf_token:
+            os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
+        try:
+            hf_dataset = load_dataset(hf_dataset_name, streaming=True)
+            if split not in hf_dataset:
+                logger.warning(f"Split '{split}' not present in dataset {hf_dataset_name}")
+            else:
+                hf_iterator = iter(hf_dataset[split])
+        except Exception as exc:
+            logger.warning(f"Failed to initialize HuggingFace streaming dataset: {exc}")
+    else:
+        logger.warning("datasets library unavailable; skipping HuggingFace streaming")
+
+    fallback_triggered = False
+    if hf_iterator is not None:
+        consecutive_errors = 0
+        while True:
+            try:
+                sample = next(hf_iterator)
+                consecutive_errors = 0
+                yield _normalize_sample_for_consistency(sample)
+            except StopIteration:
+                return
+            except (ArrowInvalid, ValueError, TypeError, KeyError) as exc:
+                consecutive_errors += 1
+                if stats is not None:
+                    stats["hf_parsing_errors"] = stats.get("hf_parsing_errors", 0) + 1
+                logger.warning(
+                    f"Streaming parse error ({type(exc).__name__}): {exc}. "
+                    f"[{consecutive_errors}/{config.HF_MAX_CONSECUTIVE_PARSE_ERRORS}]"
+                )
+                if consecutive_errors >= config.HF_MAX_CONSECUTIVE_PARSE_ERRORS:
+                    logger.error("Too many parsing errors from HuggingFace stream. Switching to fallback.")
+                    fallback_triggered = True
+                    break
+                continue
+            except Exception as exc:
+                consecutive_errors += 1
+                if stats is not None:
+                    stats["hf_unexpected_errors"] = stats.get("hf_unexpected_errors", 0) + 1
+                logger.warning(
+                    f"Unexpected streaming error ({type(exc).__name__}): {exc}. "
+                    f"[{consecutive_errors}/{config.HF_MAX_CONSECUTIVE_PARSE_ERRORS}]"
+                )
+                if consecutive_errors >= config.HF_MAX_CONSECUTIVE_PARSE_ERRORS:
+                    logger.error("Too many unexpected errors from HuggingFace stream. Switching to fallback.")
+                    fallback_triggered = True
+                    break
+                continue
+
+    if hf_iterator is None or fallback_triggered:
+        zip_path = _ensure_annotations_zip(
+            split=split,
+            annotations_dir=annotations_dir,
+            annotations_url=annotations_url,
+            config=config,
+            download_mgr=download_mgr,
+            logger=logger,
+            force_download=force_download,
+        )
+        if zip_path:
+            logger.info("Using local annotations fallback loader")
+            for sample in _iterate_annotations_from_zip(zip_path, logger, stats=stats):
+                yield sample
 
 # ========================= Download Utilities =========================
 
@@ -1053,10 +1343,12 @@ def prepare_vrsbench_dataset(
     This function automates the entire workflow:
     1. Downloads images from HuggingFace (if needed)
     2. Extracts images to local directory
-    3. Loads HuggingFace streaming dataset
-    4. Combines streaming dataset metadata with local images
-    5. Returns easy-to-use data structure with task-specific mappings
-    6. Optionally saves to JSON for easy access
+    3. Streams HuggingFace dataset with automatic fallback to local annotations when parsing fails
+    4. Normalizes inconsistent records (e.g., mixed ques_id types) to avoid ArrowInvalid crashes
+    5. Combines streaming dataset metadata with local images
+    6. Saves periodic checkpoints (every `config.CHECKPOINT_EVERY_SAMPLES`) so work is never lost
+    7. Returns easy-to-use data structure with task-specific mappings
+    8. Optionally saves to JSON for easy access
     
     This replaces the manual workflow of:
     - curl downloads
@@ -1073,20 +1365,21 @@ def prepare_vrsbench_dataset(
         hf_dataset_name: HuggingFace dataset identifier
         hf_token: HuggingFace token (or use HUGGINGFACE_HUB_TOKEN env var)
         download_images: Whether to download images (default: True)
-        images_url: Custom URL for images (default: auto-detect from split)
+    images_url: Custom URL for images (default: auto-detect from split)
         output_json: Path to save JSON mapping (optional)
         config: Configuration object (optional)
         force_download: Force re-download even if images exist
     
-    Returns:
-        Dictionary with:
-        - "samples": List of sample dicts with image_path and task-specific metadata
-        - Task-specific mappings (e.g., "image_to_caption" for captioning, "image_to_label" for classification)
-          When task="all", all mappings are included
-        - "id_to_path": Dict mapping image_id -> image_path
-        - "split": Dataset split used
-        - "task": Task type used ("all" if loading all tasks)
-        - "num_samples": Number of samples loaded
+        Returns:
+                Dictionary with:
+                - "samples": List of sample dicts with image_path and task-specific metadata
+                - Task-specific mappings (e.g., "image_to_caption" for captioning, "image_to_label" for classification)
+                    When task="all", all mappings are included
+                - "id_to_path": Dict mapping image_id -> image_path
+                - "split": Dataset split used
+                - "task": Task type used ("all" if loading all tasks)
+                - "num_samples": Number of samples loaded
+                - On-disk checkpoints saved to `config.CHECKPOINT_DIR` during processing for fault tolerance
     
     Example:
         >>> # For captioning task
@@ -1105,11 +1398,6 @@ def prepare_vrsbench_dataset(
         >>> data = prepare_vrsbench_dataset(split="validation", task="all", num_samples=1000)
         >>> # Access all mappings: image_to_caption, image_to_label, image_to_qa_pairs, image_to_bboxes
     """
-    if not HAS_DATASETS:
-        raise ImportError(
-            "HuggingFace datasets library is required. Install with: pip install datasets"
-        )
-    
     config = config or VRSBenchConfig()
     
     # Handle "all" tasks mode
@@ -1124,6 +1412,10 @@ def prepare_vrsbench_dataset(
         # Validate task
         if task not in config.SUPPORTED_TASKS:
             raise ValueError(f"Unsupported task: {task}. Choose from {config.SUPPORTED_TASKS} or 'all'")
+    if not HAS_DATASETS:
+        logger.warning(
+            "datasets library not found; will stream via local annotations fallback instead of HuggingFace."
+        )
     
     metrics = MetricsCollector()
     download_mgr = DownloadManager(config, logger, metrics)
@@ -1192,30 +1484,26 @@ def prepare_vrsbench_dataset(
                 logger.info(f"Images found in subdirectory: {actual_images_dir}")
                 images_dir = actual_images_dir
     
-    # Load HuggingFace streaming dataset
-    logger.info(f"Loading HuggingFace dataset: {hf_dataset_name}")
-    
-    # Set up authentication if token provided
-    if hf_token:
-        os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
-    
-    try:
-        hf_dataset = load_dataset(hf_dataset_name, streaming=True)
-    except Exception as e:
-        logger.error(f"Failed to load HuggingFace dataset: {e}")
-        raise
-    
-    if split not in hf_dataset:
-        raise ValueError(f"Split '{split}' not found in dataset. Available: {list(hf_dataset.keys())}")
-    
-    dataset_iterator = hf_dataset[split]
-    
-    # Combine streaming dataset with local images
+    # Prepare resilient sample generator (HF streaming + fallback)
     logger.info(f"Combining streaming dataset with local images...")
     if num_samples:
         logger.info(f"Extracting {num_samples} samples from {split} set...")
     else:
         logger.info(f"Extracting all samples from {split} set...")
+
+    sample_stats: Dict[str, int] = {}
+    dataset_iterator = _resilient_sample_generator(
+        split=split,
+        hf_dataset_name=hf_dataset_name,
+        hf_token=hf_token,
+        logger=logger,
+        config=config,
+        download_mgr=download_mgr,
+        annotations_dir=None,
+        annotations_url=None,
+        force_download=force_download,
+        stats=sample_stats,
+    )
     
     # Initialize task-specific mappings
     test_data = {
@@ -1244,256 +1532,222 @@ def prepare_vrsbench_dataset(
     
     count = 0
     skipped = 0
+    duplicates_skipped = 0
+    sample_keys_seen = set()
+    checkpoint_writer = ProgressCheckpointWriter(
+        enabled=bool(config.CHECKPOINT_EVERY_SAMPLES and config.CHECKPOINT_EVERY_SAMPLES > 0),
+        checkpoint_dir=config.CHECKPOINT_DIR,
+        split=split,
+        task=task,
+        every=config.CHECKPOINT_EVERY_SAMPLES or 0,
+        logger=logger,
+    )
     
     # Get list of local image files for matching
     logger.info(f"Building image file index...")
     local_image_files = {}
     if os.path.exists(images_dir):
-        # Collect all image files first for progress tracking
         all_image_files = []
         for root, dirs, files in os.walk(images_dir):
-            # Skip hidden dirs and macOS metadata
             dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__MACOSX']
             for file in files:
                 if file.lower().endswith(('.png', '.jpg', '.jpeg')):
                     all_image_files.append((root, file))
-        
-        # Index files with progress bar
+
         for root, file in tqdm(all_image_files, desc="Indexing image files", disable=config.LOG_LEVEL == "ERROR"):
             file_path = os.path.join(root, file)
-            # Store by basename for easy lookup
             basename = os.path.basename(file)
-            # Remove extension for matching
-            name_without_ext = os.path.splitext(basename)[0]
-            local_image_files[name_without_ext] = file_path
-            # Also store with full basename
-            local_image_files[basename] = file_path
-    
-    logger.info(f"Found {len(local_image_files)} local image files")
-    
-    # Create progress bar for sample processing
-    progress_desc = f"Processing {split} samples ({task})"
-    if num_samples:
-        pbar = tqdm(total=num_samples, desc=progress_desc, disable=config.LOG_LEVEL == "ERROR")
+
+            if basename not in local_image_files:
+                local_image_files[basename] = file_path
+            else:
+                logger.debug(f"Duplicate image basename detected: {basename} -> {file_path}")
+
+            basename_no_ext = os.path.splitext(basename)[0]
+            if basename_no_ext not in local_image_files:
+                local_image_files[basename_no_ext] = file_path
+        logger.info(f"Indexed {len(local_image_files)} image files for split '{split}'")
     else:
-        pbar = tqdm(desc=progress_desc, disable=config.LOG_LEVEL == "ERROR")
-    
-    idx = 0
+        logger.warning(f"Images directory not found: {images_dir}. Samples without local images will be skipped.")
+
+    progress_total = num_samples if num_samples else None
+    disable_progress = config.LOG_LEVEL == "ERROR"
+
     try:
-        while True:
-            if num_samples and count >= num_samples:
-                break
-            
-            try:
-                # Try to get the next sample - this is where parsing errors occur
-                sample = next(dataset_iterator)
-            except StopIteration:
-                # End of dataset
-                break
-            except (ArrowInvalid, ValueError, TypeError, KeyError) as parse_error:
-                # Handle ArrowInvalid (JSON parsing errors), ValueError (data type inconsistencies),
-                # TypeError (unexpected data types), and KeyError (missing required fields)
-                # These errors occur when HuggingFace tries to parse the JSON file
-                skipped += 1
-                pbar.set_postfix({"processed": count, "skipped": skipped})
-                if skipped <= 10:
-                    error_type = type(parse_error).__name__
-                    error_msg = str(parse_error)
-                    if len(error_msg) > 200:
-                        error_msg = error_msg[:200] + "..."
-                    logger.warning(f"⚠ Skipped sample at index {idx} due to parsing error ({error_type}): {error_msg}")
-                idx += 1
-                continue
-            except Exception as parse_error:
-                skipped += 1
-                pbar.set_postfix({"processed": count, "skipped": skipped})
-                if skipped <= 10:
-                    error_type = type(parse_error).__name__
-                    error_msg = str(parse_error)
-                    if len(error_msg) > 200:
-                        error_msg = error_msg[:200] + "..."
-                    logger.warning(f"⚠ Skipped sample at index {idx} due to unexpected parsing error ({error_type}): {error_msg}")
-                idx += 1
-                continue
-            
-            try:
-                # Try to get image_id or construct one
-                # PRIORITY 1: Check 'image' field first (contains actual image ID/filename)
-                image_id = None
-                if 'image' in sample:
-                    image_obj = sample['image']
-                    # Handle PIL Image object with filename attribute
-                    if hasattr(image_obj, 'filename'):
-                        image_id = os.path.basename(image_obj.filename)
-                    # Handle string path
-                    elif isinstance(image_obj, str):
-                        image_id = os.path.basename(image_obj)
-                    # Handle dict with path/filename
-                    elif isinstance(image_obj, dict):
-                        image_id = image_obj.get('path') or image_obj.get('filename') or image_obj.get('file_name')
-                        if image_id:
-                            image_id = os.path.basename(str(image_id))
-                
-                # PRIORITY 2: Check other common fields
-                if not image_id:
-                    if 'image_id' in sample:
-                        image_id = str(sample['image_id'])
-                    elif 'id' in sample:
-                        image_id = str(sample['id'])
-                    elif 'image_name' in sample:
-                        image_id = str(sample['image_name'])
-                    elif 'file_name' in sample:
-                        image_id = str(sample['file_name'])
+        with tqdm(total=progress_total, desc=f"Processing {split} samples", disable=disable_progress) as pbar:
+            idx = 0
+            for sample in dataset_iterator:
+                if num_samples and count >= num_samples:
+                    break
+
+                if sample is None:
+                    idx += 1
+                    continue
+
+                sample_key = _extract_sample_key(sample, idx, split)
+                if sample_key in sample_keys_seen:
+                    duplicates_skipped += 1
+                    idx += 1
+                    continue
+                sample_keys_seen.add(sample_key)
+
+                try:
+                    image_id = None
+                    if 'image' in sample:
+                        image_obj = sample['image']
+                        if hasattr(image_obj, 'filename'):
+                            image_id = os.path.basename(image_obj.filename)
+                        elif isinstance(image_obj, str):
+                            image_id = os.path.basename(image_obj)
+                        elif isinstance(image_obj, dict):
+                            image_id = image_obj.get('path') or image_obj.get('filename') or image_obj.get('file_name')
+                            if image_id:
+                                image_id = os.path.basename(str(image_id))
+
+                    if not image_id:
+                        if 'image_id' in sample:
+                            image_id = str(sample['image_id'])
+                        elif 'id' in sample:
+                            image_id = str(sample['id'])
+                        elif 'image_name' in sample:
+                            image_id = str(sample['image_name'])
+                        elif 'file_name' in sample:
+                            image_id = str(sample['file_name'])
+                        else:
+                            image_id = f"{split}_{idx:05d}"
+
+                    image_id_base = os.path.splitext(image_id)[0]
+                    image_path = None
+                    if image_id in local_image_files:
+                        image_path = local_image_files[image_id]
+                    elif image_id_base in local_image_files:
+                        image_path = local_image_files[image_id_base]
                     else:
-                        # Last resort: construct from index (but this should rarely happen)
-                        image_id = f"{split}_{idx:05d}"
-                
-                # Remove extension from image_id for matching
-                image_id_base = os.path.splitext(image_id)[0]
-                
-                # Find corresponding local image file
-                image_path = None
-                
-                # Strategy 1: Direct match by image_id (with or without extension)
-                if image_id in local_image_files:
-                    image_path = local_image_files[image_id]
-                elif image_id_base in local_image_files:
-                    image_path = local_image_files[image_id_base]
-                else:
-                    # Strategy 2: Try common patterns
-                    possible_names = [
-                        image_id,
-                        image_id_base,
-                        f"{image_id}.png",
-                        f"{image_id}.jpg",
-                        f"{image_id}.jpeg",
-                        f"{image_id_base}.png",
-                        f"{image_id_base}.jpg",
-                        f"{image_id_base}.jpeg",
-                    ]
-                    
-                    for name in possible_names:
-                        if name in local_image_files:
-                            image_path = local_image_files[name]
-                            break
-                    
-                    # REMOVED: Index-based matching fallback (this was causing the bug)
-                    # If image_path is still None, skip this sample to maintain data integrity
-                
-                if image_path and os.path.exists(image_path):
-                    # Store path mapping
-                    test_data["id_to_path"][image_id] = image_path
-                    
-                    # Extract task-specific metadata
-                    sample_info = {
-                        "image_id": image_id,
-                        "image_path": image_path,
-                        "dataset_index": idx
-                    }
-                    
-                    # Extract task-specific targets
-                    if load_all_tasks:
-                        # Load all task data for complete data loading
-                        # Captioning
-                        caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
-                        if caption:
+                        possible_names = [
+                            image_id,
+                            image_id_base,
+                            f"{image_id}.png",
+                            f"{image_id}.jpg",
+                            f"{image_id}.jpeg",
+                            f"{image_id_base}.png",
+                            f"{image_id_base}.jpg",
+                            f"{image_id_base}.jpeg",
+                        ]
+                        for name in possible_names:
+                            if name in local_image_files:
+                                image_path = local_image_files[name]
+                                break
+
+                    if image_path and os.path.exists(image_path):
+                        test_data["id_to_path"][image_id] = image_path
+                        sample_info = {
+                            "image_id": image_id,
+                            "image_path": image_path,
+                            "dataset_index": idx
+                        }
+
+                        if load_all_tasks:
+                            caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
+                            if caption:
+                                sample_info["caption"] = caption
+                                test_data["image_to_caption"][image_id] = caption
+
+                            label = None
+                            for key in ['label', 'category', 'class', 'target', 'class_id']:
+                                if key in sample:
+                                    label = sample[key]
+                                    break
+                            if label is not None:
+                                sample_info["label"] = label
+                                test_data["image_to_label"][image_id] = label
+
+                            qa_pairs = sample.get('qa_pairs', [])
+                            if qa_pairs:
+                                sample_info["qa_pairs"] = qa_pairs
+                                test_data["image_to_qa_pairs"][image_id] = qa_pairs
+                            elif 'question' in sample and 'answer' in sample:
+                                qa_pair = [(sample['question'], sample['answer'])]
+                                sample_info["qa_pairs"] = qa_pair
+                                test_data["image_to_qa_pairs"][image_id] = qa_pair
+
+                            bboxes = []
+                            if 'bbox' in sample:
+                                bboxes = [sample['bbox']]
+                            elif 'bboxes' in sample:
+                                bboxes = sample['bboxes']
+                            elif 'objects' in sample:
+                                bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+                            if bboxes:
+                                sample_info["bboxes"] = bboxes
+                                test_data["image_to_bboxes"][image_id] = bboxes
+                        elif task == "captioning":
+                            caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
                             sample_info["caption"] = caption
                             test_data["image_to_caption"][image_id] = caption
-                        
-                        # Classification
-                        label = None
-                        for key in ['label', 'category', 'class', 'target', 'class_id']:
-                            if key in sample:
-                                label = sample[key]
-                                break
-                        if label is not None:
-                            sample_info["label"] = label
-                            test_data["image_to_label"][image_id] = label
-                        
-                        # VQA
-                        qa_pairs = sample.get('qa_pairs', [])
-                        if qa_pairs:
-                            sample_info["qa_pairs"] = qa_pairs
-                            test_data["image_to_qa_pairs"][image_id] = qa_pairs
-                        elif 'question' in sample and 'answer' in sample:
-                            qa_pair = [(sample['question'], sample['answer'])]
-                            sample_info["qa_pairs"] = qa_pair
-                            test_data["image_to_qa_pairs"][image_id] = qa_pair
-                        
-                        # Detection/Grounding
-                        bboxes = []
-                        if 'bbox' in sample:
-                            bboxes = [sample['bbox']]
-                        elif 'bboxes' in sample:
-                            bboxes = sample['bboxes']
-                        elif 'objects' in sample:
-                            bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
-                        if bboxes:
-                            sample_info["bboxes"] = bboxes
-                            test_data["image_to_bboxes"][image_id] = bboxes
-                    elif task == "captioning":
-                        caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
-                        sample_info["caption"] = caption
-                        test_data["image_to_caption"][image_id] = caption
-                    elif task == "classification":
-                        # Try to find label
-                        label = None
-                        for key in ['label', 'category', 'class', 'target', 'class_id']:
-                            if key in sample:
-                                label = sample[key]
-                                break
-                        if label is not None:
-                            sample_info["label"] = label
-                            test_data["image_to_label"][image_id] = label
-                    elif task == "vqa":
-                        qa_pairs = sample.get('qa_pairs', [])
-                        if qa_pairs:
-                            sample_info["qa_pairs"] = qa_pairs
-                            test_data["image_to_qa_pairs"][image_id] = qa_pairs
-                        elif 'question' in sample and 'answer' in sample:
-                            qa_pair = [(sample['question'], sample['answer'])]
-                            sample_info["qa_pairs"] = qa_pair
-                            test_data["image_to_qa_pairs"][image_id] = qa_pair
-                    elif task in ["detection", "grounding"]:
-                        bboxes = []
-                        if 'bbox' in sample:
-                            bboxes = [sample['bbox']]
-                        elif 'bboxes' in sample:
-                            bboxes = sample['bboxes']
-                        elif 'objects' in sample:
-                            bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
-                        if bboxes:
-                            sample_info["bboxes"] = bboxes
-                            test_data["image_to_bboxes"][image_id] = bboxes
-                    
-                    # Add all other fields from dataset
-                    for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
-                               'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
-                        if key in sample and key not in sample_info:
-                            sample_info[key] = sample[key]
-                    
-                    test_data["samples"].append(sample_info)
-                    
-                    count += 1
-                    pbar.update(1)
-                    pbar.set_postfix({"processed": count, "skipped": skipped})
-                    if count % 100 == 0:
-                        logger.info(f"✓ [{count}/{num_samples if num_samples else 'all'}] Processed samples...")
-                else:
+                        elif task == "classification":
+                            label = None
+                            for key in ['label', 'category', 'class', 'target', 'class_id']:
+                                if key in sample:
+                                    label = sample[key]
+                                    break
+                            if label is not None:
+                                sample_info["label"] = label
+                                test_data["image_to_label"][image_id] = label
+                            else:
+                                raise ValueError("No label found for classification task")
+                        elif task == "vqa":
+                            qa_pairs = sample.get('qa_pairs', [])
+                            if qa_pairs:
+                                sample_info["qa_pairs"] = qa_pairs
+                                test_data["image_to_qa_pairs"][image_id] = qa_pairs
+                            elif 'question' in sample and 'answer' in sample:
+                                qa_pair = [(sample['question'], sample['answer'])]
+                                sample_info["qa_pairs"] = qa_pair
+                                test_data["image_to_qa_pairs"][image_id] = qa_pair
+                            else:
+                                raise ValueError("No QA pairs found for VQA task")
+                        elif task in ["detection", "grounding"]:
+                            bboxes = []
+                            if 'bbox' in sample:
+                                bboxes = [sample['bbox']]
+                            elif 'bboxes' in sample:
+                                bboxes = sample['bboxes']
+                            elif 'objects' in sample:
+                                bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+                            if bboxes:
+                                sample_info["bboxes"] = bboxes
+                                test_data["image_to_bboxes"][image_id] = bboxes
+                            else:
+                                raise ValueError("No bounding boxes found for detection/grounding task")
+
+                        test_data["samples"].append(sample_info)
+                        count += 1
+                        test_data["num_samples"] = count
+                        pbar.update(1)
+                        pbar.set_postfix({"processed": count, "skipped": skipped + duplicates_skipped})
+                        checkpoint_writer.maybe_checkpoint(test_data, count)
+                    else:
+                        skipped += 1
+                        pbar.set_postfix({"processed": count, "skipped": skipped + duplicates_skipped})
+                        if skipped <= 10:
+                            logger.warning(f"⚠ Skipped sample at index {idx} due to missing image path: {image_id}")
+                except Exception as e:
                     skipped += 1
-                    pbar.set_postfix({"processed": count, "skipped": skipped})
+                    pbar.set_postfix({"processed": count, "skipped": skipped + duplicates_skipped})
                     if skipped <= 10:
-                        logger.warning(f"⚠ Skipped sample {idx}: Image not found for image_id={image_id}")
-                    
-            except Exception as e:
-                skipped += 1
-                pbar.set_postfix({"processed": count, "skipped": skipped})
-                if skipped <= 10:
-                    logger.warning(f"⚠ Error processing sample {idx}: {e}")
-                continue
+                        error_type = type(e).__name__
+                        error_msg = str(e)
+                        if len(error_msg) > 200:
+                            error_msg = error_msg[:200] + "..."
+                        logger.warning(f"⚠ Skipped sample at index {idx} due to processing error ({error_type}): {error_msg}")
+
+                idx += 1
+    except KeyboardInterrupt:
+        logger.warning("Processing interrupted by user")
+        raise
     finally:
-        pbar.close()
-    
+        checkpoint_writer.finalize(test_data)
+
     test_data["num_samples"] = count
     
     logger.info(f"✓ Created dataset with {count} samples (skipped {skipped})")
@@ -1718,12 +1972,16 @@ def prepare_vrsbench_dataset_parallel(
     hf_token: Optional[str] = None,
     download_images: bool = True,
     images_url: Optional[str] = None,
+    annotations_dir: Optional[str] = None,
+    annotations_url: Optional[str] = None,
     output_json: Union[Optional[str], bool] = None,
     output_parquet: Optional[str] = None,
+    checkpoint_dir: Optional[str] = None,
+    checkpoint_every: Optional[int] = None,
     config: Optional[VRSBenchConfig] = None,
     force_download: bool = False,
     num_workers: Optional[int] = None,
-    use_multiprocessing: bool = True
+    use_multiprocessing: bool = True,
 ) -> Dict[str, Any]:
     """
     High-level parallel function to prepare VRSBench dataset for any task.
@@ -1745,6 +2003,8 @@ def prepare_vrsbench_dataset_parallel(
     - Best for datasets that fit in memory (< 10GB typically)
     - Uses ProcessPoolExecutor for true multi-core parallelism (bypasses Python GIL)
     - Optimal worker count: os.cpu_count() for CPU-bound, 4-16 for I/O-bound
+    - Shares the resilient sample generator: automatically falls back to local annotations when HF parsing fails
+    - Writes periodic checkpoints so a crash never forces you to start over
     
     Args:
         split: Dataset split ("train" or "validation")
@@ -1756,8 +2016,12 @@ def prepare_vrsbench_dataset_parallel(
         hf_token: HuggingFace token (or use HUGGINGFACE_HUB_TOKEN env var)
         download_images: Whether to download images (default: True)
         images_url: Custom URL for images (default: auto-detect from split)
+        annotations_dir: Directory to cache annotations zip used by the fallback loader
+        annotations_url: Custom URL for annotations zip (default: auto-detect from split)
         output_json: Path to save JSON mapping (optional, or True for auto-filename)
         output_parquet: Path to save parquet file (optional, 10-100x faster than JSON)
+        checkpoint_dir: Directory for periodic JSON checkpoints (default: config.CHECKPOINT_DIR)
+        checkpoint_every: Persist checkpoints every N processed samples (default: config.CHECKPOINT_EVERY_SAMPLES)
         config: Configuration object (optional)
         force_download: Force re-download even if images exist
         num_workers: Number of parallel workers (default: min(32, os.cpu_count()) for multiprocessing, min(8, os.cpu_count() * 2) for threading)
@@ -1861,7 +2125,7 @@ def prepare_vrsbench_dataset_parallel(
                 has_extracted_images = len(image_files) > 0
             except (OSError, PermissionError):
                 has_extracted_images = False
-        
+
         # Check if zip file exists and is valid
         has_zip = os.path.exists(zip_path) and os.path.getsize(zip_path) > 1024 * 1024  # At least 1MB
         
@@ -1918,102 +2182,85 @@ def prepare_vrsbench_dataset_parallel(
             local_image_files[basename] = file_path
     
     logger.info(f"Found {len(local_image_files)} local image files")
-    
-    # KEY CHANGE: Use streaming mode to avoid HF dataset generation issues
-    # Then collect samples in batches for parallel processing
-    logger.info(f"Loading HuggingFace dataset (streaming mode + parallel processing): {hf_dataset_name}")
-    
-    # Set up authentication if token provided
-    if hf_token:
-        os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
-    
-    try:
-        # Use streaming mode to avoid HF dataset generation errors
-        hf_dataset = load_dataset(hf_dataset_name, streaming=True)
-    except Exception as e:
-        logger.error(f"Failed to load HuggingFace dataset: {e}")
-        raise
-    
-    if split not in hf_dataset:
-        raise ValueError(f"Split '{split}' not found in dataset. Available: {list(hf_dataset.keys())}")
-    
-    # Collect samples from streaming dataset for parallel processing
-    dataset_iterator = hf_dataset[split]
-    logger.info(f"Collecting samples from streaming dataset for parallel processing...")
-    all_samples = []
-    skipped_parsing = 0
-    max_parsing_errors_to_log = 10
-    
-    # Collect samples with progress bar and robust error handling
+
+    # Resilient sample generator with automatic fallback to local annotations
+    logger.info(
+        f"Collecting samples using resilient loader (primary: {hf_dataset_name}, fallback: local annotations)"
+    )
+    sample_stats: Dict[str, int] = {}
+    sample_iterator = _resilient_sample_generator(
+        split=split,
+        hf_dataset_name=hf_dataset_name,
+        hf_token=hf_token,
+        logger=logger,
+        config=config,
+        download_mgr=download_mgr,
+        annotations_dir=annotations_dir,
+        annotations_url=annotations_url,
+        force_download=force_download,
+        stats=sample_stats,
+    )
+
+    all_samples: List[Tuple[int, Dict[str, Any]]] = []
+    sample_keys_seen = set()
+    duplicates_skipped = 0
     pbar_collect = tqdm(desc="Collecting samples", disable=config.LOG_LEVEL == "ERROR")
     idx = 0
+
     try:
-        while True:
+        for sample in sample_iterator:
             if num_samples and len(all_samples) >= num_samples:
                 break
-            
-            try:
-                # Try to get the next sample - this is where parsing errors occur
-                sample = next(dataset_iterator)
-                all_samples.append((idx, sample))
-                pbar_collect.update(1)
-                pbar_collect.set_postfix({"collected": len(all_samples), "skipped": skipped_parsing})
-                idx += 1
-            except StopIteration:
-                # End of dataset
-                break
-            except (ArrowInvalid, ValueError, TypeError, KeyError) as e:
-                # Handle ArrowInvalid (JSON parsing errors), ValueError (data type inconsistencies),
-                # TypeError (unexpected data types), and KeyError (missing required fields)
-                # These errors occur when HuggingFace tries to parse the JSON file
-                skipped_parsing += 1
-                if skipped_parsing <= max_parsing_errors_to_log:
-                    error_type = type(e).__name__
-                    error_msg = str(e)
-                    # Truncate very long error messages for readability
-                    if len(error_msg) > 200:
-                        error_msg = error_msg[:200] + "..."
-                    logger.warning(f"⚠ Skipped sample at index {idx} due to parsing error ({error_type}): {error_msg}")
-                pbar_collect.update(1)
-                pbar_collect.set_postfix({"collected": len(all_samples), "skipped": skipped_parsing})
+            if sample is None:
                 idx += 1
                 continue
-            except Exception as e:
-                # Catch any other unexpected errors during sample collection
-                skipped_parsing += 1
-                if skipped_parsing <= max_parsing_errors_to_log:
-                    error_type = type(e).__name__
-                    error_msg = str(e)
-                    if len(error_msg) > 200:
-                        error_msg = error_msg[:200] + "..."
-                    logger.warning(f"⚠ Skipped sample at index {idx} due to unexpected error ({error_type}): {error_msg}")
-                pbar_collect.update(1)
-                pbar_collect.set_postfix({"collected": len(all_samples), "skipped": skipped_parsing})
+
+            sample_key = _extract_sample_key(sample, idx, split)
+            if sample_key in sample_keys_seen:
+                duplicates_skipped += 1
                 idx += 1
                 continue
+
+            sample_keys_seen.add(sample_key)
+            all_samples.append((idx, sample))
+            pbar_collect.update(1)
+            pbar_collect.set_postfix({
+                "collected": len(all_samples),
+                "skipped": duplicates_skipped + sample_stats.get("hf_parsing_errors", 0)
+            })
+            idx += 1
     except KeyboardInterrupt:
         logger.warning("Sample collection interrupted by user")
-        pbar_collect.close()
         raise
     except Exception as e:
         logger.error(f"Fatal error during sample collection: {e}")
-        pbar_collect.close()
         raise
     finally:
         pbar_collect.close()
-    
-    # Log summary of skipped samples
-    if skipped_parsing > 0:
-        logger.warning(f"⚠ Skipped {skipped_parsing} samples due to parsing errors (inconsistent data types in dataset)")
-        logger.info(f"✓ Successfully collected {len(all_samples)} valid samples out of {len(all_samples) + skipped_parsing} total")
+
+    skipped_parsing = (
+        sample_stats.get("hf_parsing_errors", 0)
+        + sample_stats.get("hf_unexpected_errors", 0)
+        + sample_stats.get("annotation_parse_errors", 0)
+        + sample_stats.get("annotation_read_errors", 0)
+    )
+    total_skipped = skipped_parsing + duplicates_skipped
+
+    if total_skipped > 0:
+        logger.warning(
+            f"⚠ Skipped {total_skipped} samples (parse errors: {skipped_parsing}, duplicates: {duplicates_skipped})"
+        )
+        logger.info(
+            f"✓ Successfully collected {len(all_samples)} valid samples out of {len(all_samples) + total_skipped} attempted"
+        )
     else:
         logger.info(f"✓ Successfully collected {len(all_samples)} samples")
     
     if len(all_samples) == 0:
         raise ValueError(
-            f"No valid samples could be collected from the dataset. "
-            f"This may indicate a dataset format issue or all samples had parsing errors. "
-            f"Total samples skipped: {skipped_parsing}"
+            "No valid samples could be collected from the dataset. "
+            "This may indicate a dataset format issue or all samples had parsing errors. "
+            f"Total samples skipped: {total_skipped}"
         )
     
     logger.info(f"Collected {len(all_samples)} samples, processing in parallel with {num_workers} workers...")
@@ -2043,6 +2290,19 @@ def prepare_vrsbench_dataset_parallel(
     elif task in ["detection", "grounding"]:
         test_data["image_to_bboxes"] = {}
     
+    # Checkpoint writer for incremental persistence
+    effective_checkpoint_every = (
+        checkpoint_every if checkpoint_every is not None else config.CHECKPOINT_EVERY_SAMPLES
+    )
+    checkpoint_writer = ProgressCheckpointWriter(
+        enabled=bool(effective_checkpoint_every and effective_checkpoint_every > 0),
+        checkpoint_dir=checkpoint_dir or config.CHECKPOINT_DIR,
+        split=split,
+        task=task,
+        every=effective_checkpoint_every or 0,
+        logger=logger,
+    )
+
     # Thread-safe counters (for threading mode)
     count_lock = threading.Lock()
     count = 0
@@ -2336,6 +2596,7 @@ def prepare_vrsbench_dataset_parallel(
                                     test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
                             
                             count += 1
+                            checkpoint_writer.maybe_checkpoint(test_data, count)
                         else:
                             skipped += 1
                         
@@ -2409,6 +2670,7 @@ def prepare_vrsbench_dataset_parallel(
                                 test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
                         
                         count += 1
+                        checkpoint_writer.maybe_checkpoint(test_data, count)
                     else:
                         skipped += 1
                     
@@ -2433,6 +2695,7 @@ def prepare_vrsbench_dataset_parallel(
     test_data["num_samples"] = count
     rate = count / elapsed if elapsed > 0 else 0
     logger.info(f"✓ Created dataset with {count} samples (skipped {skipped}) in {elapsed:.2f}s ({rate:.1f} samples/sec)")
+    checkpoint_writer.finalize(test_data)
     
     # Record metrics
     metrics.record_time("parallel_preparation", elapsed)
