@@ -1353,6 +1353,133 @@ def prepare_vrsbench_dataset(
     return test_data
 
 
+# ========================= Multiprocessing Helper =========================
+
+def _process_single_sample_mp(args):
+    """
+    Process a single sample for multiprocessing (process-safe version).
+    
+    This is a module-level function to ensure it can be pickled for multiprocessing.
+    Used with ProcessPoolExecutor for true parallelism.
+    
+    Args:
+        args: Tuple of (idx, sample, image_files_dict, task, split)
+    
+    Returns:
+        Dictionary with sample_info, task_data, and id_to_path, or None if processing failed
+    """
+    idx, sample, image_files_dict, task_mp, split_mp = args
+    
+    try:
+        # Try to get image_id or construct one
+        image_id = None
+        if 'image_id' in sample:
+            image_id = str(sample['image_id'])
+        elif 'id' in sample:
+            image_id = str(sample['id'])
+        elif 'image_name' in sample:
+            image_id = str(sample['image_name'])
+        elif 'file_name' in sample:
+            image_id = str(sample['file_name'])
+        else:
+            image_id = f"{split_mp}_{idx:05d}"
+        
+        image_id_base = os.path.splitext(image_id)[0]
+        image_path = None
+        
+        # Strategy 1: Direct match
+        if image_id in image_files_dict:
+            image_path = image_files_dict[image_id]
+        elif image_id_base in image_files_dict:
+            image_path = image_files_dict[image_id_base]
+        else:
+            # Strategy 2: Try common patterns
+            possible_names = [
+                image_id, image_id_base,
+                f"{image_id}.png", f"{image_id}.jpg", f"{image_id}.jpeg",
+                f"{image_id_base}.png", f"{image_id_base}.jpg", f"{image_id_base}.jpeg",
+            ]
+            for name in possible_names:
+                if name in image_files_dict:
+                    image_path = image_files_dict[name]
+                    break
+            
+            # Strategy 3: Index-based fallback
+            if image_path is None:
+                sorted_files = sorted(image_files_dict.items())
+                if idx < len(sorted_files):
+                    image_path = sorted_files[idx][1]
+        
+        # File existence check
+        if not image_path or not os.path.exists(image_path):
+            return None
+        
+        # Extract task-specific metadata
+        sample_info = {
+            "image_id": image_id,
+            "image_path": image_path,
+            "dataset_index": idx
+        }
+        
+        task_data = {}
+        
+        # Extract task-specific targets
+        if task_mp == "captioning":
+            caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
+            sample_info["caption"] = caption
+            task_data["image_to_caption"] = {image_id: caption}
+        elif task_mp == "classification":
+            label = None
+            for key in ['label', 'category', 'class', 'target', 'class_id']:
+                if key in sample:
+                    label = sample[key]
+                    break
+            if label is not None:
+                sample_info["label"] = label
+                task_data["image_to_label"] = {image_id: label}
+            else:
+                return None
+        elif task_mp == "vqa":
+            qa_pairs = sample.get('qa_pairs', [])
+            if qa_pairs:
+                sample_info["qa_pairs"] = qa_pairs
+                task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
+            elif 'question' in sample and 'answer' in sample:
+                qa_pair = [(sample['question'], sample['answer'])]
+                sample_info["qa_pairs"] = qa_pair
+                task_data["image_to_qa_pairs"] = {image_id: qa_pair}
+            else:
+                return None
+        elif task_mp in ["detection", "grounding"]:
+            bboxes = []
+            if 'bbox' in sample:
+                bboxes = [sample['bbox']]
+            elif 'bboxes' in sample:
+                bboxes = sample['bboxes']
+            elif 'objects' in sample:
+                bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+            if bboxes:
+                sample_info["bboxes"] = bboxes
+                task_data["image_to_bboxes"] = {image_id: bboxes}
+            else:
+                return None
+        
+        # Add all other fields
+        for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
+                   'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
+            if key in sample and key not in sample_info:
+                sample_info[key] = sample[key]
+        
+        return {
+            "sample_info": sample_info,
+            "task_data": task_data,
+            "id_to_path": {image_id: image_path}
+        }
+        
+    except Exception as e:
+        return None
+
+
 def prepare_vrsbench_dataset_parallel(
     split: str = "validation",
     task: str = "captioning",
@@ -1449,7 +1576,9 @@ def prepare_vrsbench_dataset_parallel(
     # Set optimal worker count if not provided
     if num_workers is None:
         if use_multiprocessing:
-            num_workers = os.cpu_count() or 8  # Use all CPU cores for multiprocessing
+            # Limit to reasonable number (32 is optimal for most cases)
+            # Too many workers cause overhead and memory issues
+            num_workers = min(32, os.cpu_count() or 8)
         else:
             num_workers = min(8, (os.cpu_count() or 4) * 2)  # 4-16 for threading
     
@@ -1744,131 +1873,6 @@ def prepare_vrsbench_dataset_parallel(
             # Log error but don't fail entire batch
             return None
     
-    # Create process-safe version for multiprocessing (passes image_files as parameter)
-    def process_single_sample_mp(args):
-        """
-        Process a single sample for multiprocessing (process-safe version).
-        
-        This version accepts image_files_dict as a parameter since processes
-        don't share memory. Used with ProcessPoolExecutor for true parallelism.
-        
-        Args:
-            args: Tuple of (idx, sample, image_files_dict, task, split)
-        
-        Returns:
-            Dictionary with sample_info, task_data, and id_to_path, or None if processing failed
-        """
-        idx, sample, image_files_dict, task_mp, split_mp = args
-        
-        try:
-            # Try to get image_id or construct one
-            image_id = None
-            if 'image_id' in sample:
-                image_id = str(sample['image_id'])
-            elif 'id' in sample:
-                image_id = str(sample['id'])
-            elif 'image_name' in sample:
-                image_id = str(sample['image_name'])
-            elif 'file_name' in sample:
-                image_id = str(sample['file_name'])
-            else:
-                image_id = f"{split_mp}_{idx:05d}"
-            
-            image_id_base = os.path.splitext(image_id)[0]
-            image_path = None
-            
-            # Strategy 1: Direct match
-            if image_id in image_files_dict:
-                image_path = image_files_dict[image_id]
-            elif image_id_base in image_files_dict:
-                image_path = image_files_dict[image_id_base]
-            else:
-                # Strategy 2: Try common patterns
-                possible_names = [
-                    image_id, image_id_base,
-                    f"{image_id}.png", f"{image_id}.jpg", f"{image_id}.jpeg",
-                    f"{image_id_base}.png", f"{image_id_base}.jpg", f"{image_id_base}.jpeg",
-                ]
-                for name in possible_names:
-                    if name in image_files_dict:
-                        image_path = image_files_dict[name]
-                        break
-                
-                # Strategy 3: Index-based fallback
-                if image_path is None:
-                    sorted_files = sorted(image_files_dict.items())
-                    if idx < len(sorted_files):
-                        image_path = sorted_files[idx][1]
-            
-            # File existence check
-            if not image_path or not os.path.exists(image_path):
-                return None
-            
-            # Extract task-specific metadata
-            sample_info = {
-                "image_id": image_id,
-                "image_path": image_path,
-                "dataset_index": idx
-            }
-            
-            task_data = {}
-            
-            # Extract task-specific targets
-            if task_mp == "captioning":
-                caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
-                sample_info["caption"] = caption
-                task_data["image_to_caption"] = {image_id: caption}
-            elif task_mp == "classification":
-                label = None
-                for key in ['label', 'category', 'class', 'target', 'class_id']:
-                    if key in sample:
-                        label = sample[key]
-                        break
-                if label is not None:
-                    sample_info["label"] = label
-                    task_data["image_to_label"] = {image_id: label}
-                else:
-                    return None
-            elif task_mp == "vqa":
-                qa_pairs = sample.get('qa_pairs', [])
-                if qa_pairs:
-                    sample_info["qa_pairs"] = qa_pairs
-                    task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
-                elif 'question' in sample and 'answer' in sample:
-                    qa_pair = [(sample['question'], sample['answer'])]
-                    sample_info["qa_pairs"] = qa_pair
-                    task_data["image_to_qa_pairs"] = {image_id: qa_pair}
-                else:
-                    return None
-            elif task_mp in ["detection", "grounding"]:
-                bboxes = []
-                if 'bbox' in sample:
-                    bboxes = [sample['bbox']]
-                elif 'bboxes' in sample:
-                    bboxes = sample['bboxes']
-                elif 'objects' in sample:
-                    bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
-                if bboxes:
-                    sample_info["bboxes"] = bboxes
-                    task_data["image_to_bboxes"] = {image_id: bboxes}
-                else:
-                    return None
-            
-            # Add all other fields
-            for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
-                       'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
-                if key in sample and key not in sample_info:
-                    sample_info[key] = sample[key]
-            
-            return {
-                "sample_info": sample_info,
-                "task_data": task_data,
-                "id_to_path": {image_id: image_path}
-            }
-            
-        except Exception as e:
-            return None
-    
     # Prepare arguments for parallel processing
     args_list = all_samples  # Already in (idx, sample) format
     
@@ -1876,11 +1880,16 @@ def prepare_vrsbench_dataset_parallel(
     # Note: On Windows, multiprocessing requires if __name__ == "__main__" guard
     # For better compatibility, we check if we're in main or if multiprocessing is safe
     if use_multiprocessing and num_workers > 1:
+        # Detect Colab environment
+        is_colab = 'google.colab' in sys.modules
+        
         # Set multiprocessing start method (if not already set)
-        # Use 'fork' on Linux (faster) and 'spawn' on Windows (required)
         try:
-            if sys.platform == 'win32':
-                mp.set_start_method('spawn', force=False)  # Required on Windows
+            if sys.platform == 'win32' or is_colab:
+                # Windows and Colab require 'spawn' method
+                mp.set_start_method('spawn', force=False)
+                if is_colab:
+                    logger.info("Colab detected: Using 'spawn' method for multiprocessing")
             else:
                 # On Linux/Unix, 'fork' is default and faster, but try to set it explicitly
                 try:
@@ -1904,52 +1913,62 @@ def prepare_vrsbench_dataset_parallel(
         args_list_mp = [(idx, sample, image_files_copy, task, split) 
                        for idx, sample in args_list]
         
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            # Submit all tasks
-            future_to_args = {executor.submit(process_single_sample_mp, args): args for args in args_list_mp}
-            
-            # Collect results as they complete
-            completed = 0
-            for future in as_completed(future_to_args):
-                completed += 1
-                result = future.result()
+        # Try ProcessPoolExecutor with error handling and fallback
+        try:
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all tasks using module-level function (pickleable)
+                future_to_args = {executor.submit(_process_single_sample_mp, args): args for args in args_list_mp}
                 
-                with count_lock:
-                    if result:
-                        test_data["samples"].append(result["sample_info"])
-                        test_data["id_to_path"].update(result["id_to_path"])
-                        
-                        # Update task-specific mappings
-                        if "image_to_caption" in result["task_data"]:
-                            test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
-                        elif "image_to_label" in result["task_data"]:
-                            test_data["image_to_label"].update(result["task_data"]["image_to_label"])
-                        elif "image_to_qa_pairs" in result["task_data"]:
-                            test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
-                        elif "image_to_bboxes" in result["task_data"]:
-                            test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
-                        
-                        count += 1
-                    else:
-                        skipped += 1
+                # Collect results as they complete
+                completed = 0
+                for future in as_completed(future_to_args):
+                    completed += 1
+                    result = future.result()
                     
-                    # Update progress bar
-                    elapsed = time.time() - start_time
-                    rate = count / elapsed if elapsed > 0 else 0
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        "processed": count,
-                        "skipped": skipped,
-                        "rate": f"{rate:.1f}/s"
-                    })
-                    
-                    # Progress logging (every 500 samples)
-                    if count % 500 == 0:
-                        logger.info(f"✓ [{count}/{len(all_samples)}] Processed samples... ({rate:.1f} samples/sec)")
+                    with count_lock:
+                        if result:
+                            test_data["samples"].append(result["sample_info"])
+                            test_data["id_to_path"].update(result["id_to_path"])
+                            
+                            # Update task-specific mappings
+                            if "image_to_caption" in result["task_data"]:
+                                test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
+                            elif "image_to_label" in result["task_data"]:
+                                test_data["image_to_label"].update(result["task_data"]["image_to_label"])
+                            elif "image_to_qa_pairs" in result["task_data"]:
+                                test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
+                            elif "image_to_bboxes" in result["task_data"]:
+                                test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
+                            
+                            count += 1
+                        else:
+                            skipped += 1
+                        
+                        # Update progress bar
+                        elapsed = time.time() - start_time
+                        rate = count / elapsed if elapsed > 0 else 0
+                        pbar.update(1)
+                        pbar.set_postfix({
+                            "processed": count,
+                            "skipped": skipped,
+                            "rate": f"{rate:.1f}/s"
+                        })
+                        
+                        # Progress logging (every 500 samples)
+                        if count % 500 == 0:
+                            logger.info(f"✓ [{count}/{len(all_samples)}] Processed samples... ({rate:.1f} samples/sec)")
+            
+            pbar.close()
+            
+        except (AttributeError, TypeError, Exception) as e:
+            # If pickling fails (e.g., nested function issue), fall back to threading
+            logger.warning(f"ProcessPoolExecutor failed ({type(e).__name__}: {e}), falling back to ThreadPoolExecutor")
+            logger.warning("This may indicate the function cannot be pickled. Using threading mode instead.")
+            use_multiprocessing = False
+            num_workers = min(8, (os.cpu_count() or 4) * 2)
+            # Continue with ThreadPoolExecutor below
         
-        pbar.close()
-        
-    else:
+    if not use_multiprocessing or num_workers <= 1:
         # Use ThreadPoolExecutor for I/O-bound operations or when multiprocessing disabled
         logger.info(f"Using ThreadPoolExecutor with {num_workers} threads (I/O-bound mode)")
         start_time = time.time()
