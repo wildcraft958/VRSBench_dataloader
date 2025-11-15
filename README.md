@@ -42,7 +42,7 @@ This loader eliminates all of that. **One function call replaces 50+ lines of bo
 
 **Region Extraction**: Automatic bounding box normalization. Region cropping for high-resolution satellite imagery. Configurable padding around regions.
 
-**Production Guardrails**: Exception handling with detailed error context. Automatic image path resolution (absolute, relative, basename search). Graceful degradation when optional dependencies missing.
+**Production Guardrails**: Exception handling with detailed error context. Automatic image path resolution (absolute, relative, basename search). Graceful degradation when optional dependencies missing. Robust error handling for dataset parsing errors (ArrowInvalid, type inconsistencies) - automatically skips problematic samples and continues processing.
 
 ## Installation
 
@@ -778,6 +778,19 @@ data = prepare_vrsbench_dataset_parallel(
 
 **Solution**: This is now fixed! The code now properly extracts image IDs from the dataset's `'image'` field (PIL Image objects with filename attribute, string paths, or dict formats). The problematic index-based fallback has been removed to ensure data integrity. Each sample is now correctly matched to its corresponding image file.
 
+### ArrowInvalid / JSON Parsing Errors
+
+**Problem**: `ArrowInvalid: JSON parse error: Column(/qa_pairs/[]/ques_id) changed from string to number` or similar parsing errors when loading the dataset.
+
+**Solution**: This is now handled gracefully! The code automatically:
+- Catches parsing errors (ArrowInvalid, ValueError, TypeError, KeyError) during sample collection
+- Skips problematic samples with detailed logging (first 10 errors logged)
+- Continues processing remaining samples
+- Provides a summary of skipped samples at the end
+- Validates that at least some samples were successfully collected
+
+The function will complete successfully even if some samples have parsing errors due to inconsistent data types in the dataset. Progress bar shows both collected and skipped sample counts.
+
 ## Performance Benchmarks
 
 **Benchmarks** (NVIDIA V100, 32GB RAM, SSD, VRSBench validation set - 1,131 samples):
@@ -824,6 +837,9 @@ MIT License
 - ✨ **Complete Task Mode** - Added support for `task="complete"` or `task="all"` to load all task-specific metadata in a single pass
 - 🐛 **Fixed Task Mapping Bug** - Corrected task mapping update logic to handle both "complete" and "all" task modes
 - 📝 **Improved Data Integrity** - Samples are now skipped if image matching fails, rather than assigning incorrect images
+- 🛡️ **Robust Error Handling** - Added production-ready error handling for ArrowInvalid/JSON parsing errors (type inconsistencies in dataset)
+- 🛡️ **Graceful Degradation** - Automatically skips problematic samples and continues processing, with detailed logging and progress tracking
+- 🛡️ **Validation** - Ensures at least some valid samples are collected before proceeding
 
 ### Version 3.1.0 (2025-01-15) - Multiprocessing & Performance Improvements
 - ✨ **True Multi-Core Parallelism** - Uses ProcessPoolExecutor to bypass Python GIL and utilize all CPU cores

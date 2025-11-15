@@ -58,11 +58,15 @@ except ImportError:
 try:
     import pyarrow.parquet as pq
     import pyarrow as pa
+    from pyarrow.lib import ArrowInvalid
     HAS_PARQUET = True
 except ImportError:
     HAS_PARQUET = False
     pq = None
     pa = None
+    # Create a dummy ArrowInvalid class for error handling
+    class ArrowInvalid(Exception):
+        pass
 
 # ========================= Configuration =========================
 
@@ -1274,10 +1278,43 @@ def prepare_vrsbench_dataset(
     else:
         pbar = tqdm(desc=progress_desc, disable=config.LOG_LEVEL == "ERROR")
     
+    idx = 0
     try:
-        for idx, sample in enumerate(dataset_iterator):
+        while True:
             if num_samples and count >= num_samples:
                 break
+            
+            try:
+                # Try to get the next sample - this is where parsing errors occur
+                sample = next(dataset_iterator)
+            except StopIteration:
+                # End of dataset
+                break
+            except (ArrowInvalid, ValueError, TypeError, KeyError) as parse_error:
+                # Handle ArrowInvalid (JSON parsing errors), ValueError (data type inconsistencies),
+                # TypeError (unexpected data types), and KeyError (missing required fields)
+                # These errors occur when HuggingFace tries to parse the JSON file
+                skipped += 1
+                pbar.set_postfix({"processed": count, "skipped": skipped})
+                if skipped <= 10:
+                    error_type = type(parse_error).__name__
+                    error_msg = str(parse_error)
+                    if len(error_msg) > 200:
+                        error_msg = error_msg[:200] + "..."
+                    logger.warning(f"⚠ Skipped sample at index {idx} due to parsing error ({error_type}): {error_msg}")
+                idx += 1
+                continue
+            except Exception as parse_error:
+                skipped += 1
+                pbar.set_postfix({"processed": count, "skipped": skipped})
+                if skipped <= 10:
+                    error_type = type(parse_error).__name__
+                    error_msg = str(parse_error)
+                    if len(error_msg) > 200:
+                        error_msg = error_msg[:200] + "..."
+                    logger.warning(f"⚠ Skipped sample at index {idx} due to unexpected parsing error ({error_type}): {error_msg}")
+                idx += 1
+                continue
             
             try:
                 # Try to get image_id or construct one
@@ -1904,16 +1941,80 @@ def prepare_vrsbench_dataset_parallel(
     dataset_iterator = hf_dataset[split]
     logger.info(f"Collecting samples from streaming dataset for parallel processing...")
     all_samples = []
+    skipped_parsing = 0
+    max_parsing_errors_to_log = 10
     
-    # Collect samples with progress bar
+    # Collect samples with progress bar and robust error handling
     pbar_collect = tqdm(desc="Collecting samples", disable=config.LOG_LEVEL == "ERROR")
-    for idx, sample in enumerate(dataset_iterator):
-        if num_samples and len(all_samples) >= num_samples:
-            break
-        all_samples.append((idx, sample))
-        pbar_collect.update(1)
-        pbar_collect.set_postfix({"collected": len(all_samples)})
-    pbar_collect.close()
+    idx = 0
+    try:
+        while True:
+            if num_samples and len(all_samples) >= num_samples:
+                break
+            
+            try:
+                # Try to get the next sample - this is where parsing errors occur
+                sample = next(dataset_iterator)
+                all_samples.append((idx, sample))
+                pbar_collect.update(1)
+                pbar_collect.set_postfix({"collected": len(all_samples), "skipped": skipped_parsing})
+                idx += 1
+            except StopIteration:
+                # End of dataset
+                break
+            except (ArrowInvalid, ValueError, TypeError, KeyError) as e:
+                # Handle ArrowInvalid (JSON parsing errors), ValueError (data type inconsistencies),
+                # TypeError (unexpected data types), and KeyError (missing required fields)
+                # These errors occur when HuggingFace tries to parse the JSON file
+                skipped_parsing += 1
+                if skipped_parsing <= max_parsing_errors_to_log:
+                    error_type = type(e).__name__
+                    error_msg = str(e)
+                    # Truncate very long error messages for readability
+                    if len(error_msg) > 200:
+                        error_msg = error_msg[:200] + "..."
+                    logger.warning(f"⚠ Skipped sample at index {idx} due to parsing error ({error_type}): {error_msg}")
+                pbar_collect.update(1)
+                pbar_collect.set_postfix({"collected": len(all_samples), "skipped": skipped_parsing})
+                idx += 1
+                continue
+            except Exception as e:
+                # Catch any other unexpected errors during sample collection
+                skipped_parsing += 1
+                if skipped_parsing <= max_parsing_errors_to_log:
+                    error_type = type(e).__name__
+                    error_msg = str(e)
+                    if len(error_msg) > 200:
+                        error_msg = error_msg[:200] + "..."
+                    logger.warning(f"⚠ Skipped sample at index {idx} due to unexpected error ({error_type}): {error_msg}")
+                pbar_collect.update(1)
+                pbar_collect.set_postfix({"collected": len(all_samples), "skipped": skipped_parsing})
+                idx += 1
+                continue
+    except KeyboardInterrupt:
+        logger.warning("Sample collection interrupted by user")
+        pbar_collect.close()
+        raise
+    except Exception as e:
+        logger.error(f"Fatal error during sample collection: {e}")
+        pbar_collect.close()
+        raise
+    finally:
+        pbar_collect.close()
+    
+    # Log summary of skipped samples
+    if skipped_parsing > 0:
+        logger.warning(f"⚠ Skipped {skipped_parsing} samples due to parsing errors (inconsistent data types in dataset)")
+        logger.info(f"✓ Successfully collected {len(all_samples)} valid samples out of {len(all_samples) + skipped_parsing} total")
+    else:
+        logger.info(f"✓ Successfully collected {len(all_samples)} samples")
+    
+    if len(all_samples) == 0:
+        raise ValueError(
+            f"No valid samples could be collected from the dataset. "
+            f"This may indicate a dataset format issue or all samples had parsing errors. "
+            f"Total samples skipped: {skipped_parsing}"
+        )
     
     logger.info(f"Collected {len(all_samples)} samples, processing in parallel with {num_workers} workers...")
     
