@@ -1281,18 +1281,35 @@ def prepare_vrsbench_dataset(
             
             try:
                 # Try to get image_id or construct one
+                # PRIORITY 1: Check 'image' field first (contains actual image ID/filename)
                 image_id = None
-                if 'image_id' in sample:
-                    image_id = str(sample['image_id'])
-                elif 'id' in sample:
-                    image_id = str(sample['id'])
-                elif 'image_name' in sample:
-                    image_id = str(sample['image_name'])
-                elif 'file_name' in sample:
-                    image_id = str(sample['file_name'])
-                else:
-                    # Construct from index
-                    image_id = f"{split}_{idx:05d}"
+                if 'image' in sample:
+                    image_obj = sample['image']
+                    # Handle PIL Image object with filename attribute
+                    if hasattr(image_obj, 'filename'):
+                        image_id = os.path.basename(image_obj.filename)
+                    # Handle string path
+                    elif isinstance(image_obj, str):
+                        image_id = os.path.basename(image_obj)
+                    # Handle dict with path/filename
+                    elif isinstance(image_obj, dict):
+                        image_id = image_obj.get('path') or image_obj.get('filename') or image_obj.get('file_name')
+                        if image_id:
+                            image_id = os.path.basename(str(image_id))
+                
+                # PRIORITY 2: Check other common fields
+                if not image_id:
+                    if 'image_id' in sample:
+                        image_id = str(sample['image_id'])
+                    elif 'id' in sample:
+                        image_id = str(sample['id'])
+                    elif 'image_name' in sample:
+                        image_id = str(sample['image_name'])
+                    elif 'file_name' in sample:
+                        image_id = str(sample['file_name'])
+                    else:
+                        # Last resort: construct from index (but this should rarely happen)
+                        image_id = f"{split}_{idx:05d}"
                 
                 # Remove extension from image_id for matching
                 image_id_base = os.path.splitext(image_id)[0]
@@ -1323,11 +1340,8 @@ def prepare_vrsbench_dataset(
                             image_path = local_image_files[name]
                             break
                     
-                    # Strategy 3: Index-based matching (fallback)
-                    if image_path is None:
-                        sorted_files = sorted(local_image_files.items())
-                        if idx < len(sorted_files):
-                            image_path = sorted_files[idx][1]
+                    # REMOVED: Index-based matching fallback (this was causing the bug)
+                    # If image_path is still None, skip this sample to maintain data integrity
                 
                 if image_path and os.path.exists(image_path):
                     # Store path mapping
@@ -1480,17 +1494,35 @@ def _process_single_sample_mp(args):
     
     try:
         # Try to get image_id or construct one
+        # PRIORITY 1: Check 'image' field first (contains actual image ID/filename)
         image_id = None
-        if 'image_id' in sample:
-            image_id = str(sample['image_id'])
-        elif 'id' in sample:
-            image_id = str(sample['id'])
-        elif 'image_name' in sample:
-            image_id = str(sample['image_name'])
-        elif 'file_name' in sample:
-            image_id = str(sample['file_name'])
-        else:
-            image_id = f"{split_mp}_{idx:05d}"
+        if 'image' in sample:
+            image_obj = sample['image']
+            # Handle PIL Image object with filename attribute
+            if hasattr(image_obj, 'filename'):
+                image_id = os.path.basename(image_obj.filename)
+            # Handle string path
+            elif isinstance(image_obj, str):
+                image_id = os.path.basename(image_obj)
+            # Handle dict with path/filename
+            elif isinstance(image_obj, dict):
+                image_id = image_obj.get('path') or image_obj.get('filename') or image_obj.get('file_name')
+                if image_id:
+                    image_id = os.path.basename(str(image_id))
+        
+        # PRIORITY 2: Check other common fields
+        if not image_id:
+            if 'image_id' in sample:
+                image_id = str(sample['image_id'])
+            elif 'id' in sample:
+                image_id = str(sample['id'])
+            elif 'image_name' in sample:
+                image_id = str(sample['image_name'])
+            elif 'file_name' in sample:
+                image_id = str(sample['file_name'])
+            else:
+                # Last resort: construct from index (but this should rarely happen)
+                image_id = f"{split_mp}_{idx:05d}"
         
         image_id_base = os.path.splitext(image_id)[0]
         image_path = None
@@ -1512,11 +1544,9 @@ def _process_single_sample_mp(args):
                     image_path = image_files_dict[name]
                     break
             
-            # Strategy 3: Index-based fallback
-            if image_path is None:
-                sorted_files = sorted(image_files_dict.items())
-                if idx < len(sorted_files):
-                    image_path = sorted_files[idx][1]
+            # REMOVED: Index-based fallback (this was causing the bug)
+            # If image_path is still None, we should skip this sample rather than assign wrong image
+            # This ensures data integrity
         
         # File existence check
         if not image_path or not os.path.exists(image_path):
@@ -1937,18 +1967,35 @@ def prepare_vrsbench_dataset_parallel(
         
         try:
             # Try to get image_id or construct one
+            # PRIORITY 1: Check 'image' field first (contains actual image ID/filename)
             image_id = None
-            if 'image_id' in sample:
-                image_id = str(sample['image_id'])
-            elif 'id' in sample:
-                image_id = str(sample['id'])
-            elif 'image_name' in sample:
-                image_id = str(sample['image_name'])
-            elif 'file_name' in sample:
-                image_id = str(sample['file_name'])
-            else:
-                # Construct from index
-                image_id = f"{split}_{idx:05d}"
+            if 'image' in sample:
+                image_obj = sample['image']
+                # Handle PIL Image object with filename attribute
+                if hasattr(image_obj, 'filename'):
+                    image_id = os.path.basename(image_obj.filename)
+                # Handle string path
+                elif isinstance(image_obj, str):
+                    image_id = os.path.basename(image_obj)
+                # Handle dict with path/filename
+                elif isinstance(image_obj, dict):
+                    image_id = image_obj.get('path') or image_obj.get('filename') or image_obj.get('file_name')
+                    if image_id:
+                        image_id = os.path.basename(str(image_id))
+            
+            # PRIORITY 2: Check other common fields
+            if not image_id:
+                if 'image_id' in sample:
+                    image_id = str(sample['image_id'])
+                elif 'id' in sample:
+                    image_id = str(sample['id'])
+                elif 'image_name' in sample:
+                    image_id = str(sample['image_name'])
+                elif 'file_name' in sample:
+                    image_id = str(sample['file_name'])
+                else:
+                    # Last resort: construct from index (but this should rarely happen)
+                    image_id = f"{split}_{idx:05d}"
             
             # Remove extension from image_id for matching
             image_id_base = os.path.splitext(image_id)[0]
@@ -1979,11 +2026,8 @@ def prepare_vrsbench_dataset_parallel(
                         image_path = image_files_dict[name]
                         break
                 
-                # Strategy 3: Index-based matching (fallback)
-                if image_path is None:
-                    sorted_files = sorted(image_files_dict.items())
-                    if idx < len(sorted_files):
-                        image_path = sorted_files[idx][1]
+                # REMOVED: Index-based matching fallback (this was causing the bug)
+                # If image_path is still None, we should skip this sample rather than assign wrong image
             
             # File existence check (I/O bound - benefits from threading)
             if not image_path or not os.path.exists(image_path):
