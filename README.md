@@ -1,6 +1,6 @@
 # VRSBench DataLoader
 
-**Version:** 3.0.0  
+**Version:** 3.2.0  
 **Author:** Animesh Raj  
 
 Production-ready PyTorch DataLoader for the VRSBench (Vision-language for Remote Sensing) dataset. Built for enterprise workloads with hardened reliability, comprehensive logging, and multi-task abstractions that eliminate boilerplate across classification, detection, captioning, VQA, and visual grounding tasks.
@@ -28,7 +28,7 @@ This loader eliminates all of that. **One function call replaces 50+ lines of bo
 
 ## What It Does
 
-**Multi-Task Support**: Unified API for classification, detection, captioning, VQA, and visual grounding. Task-specific target extraction is built-in.
+**Multi-Task Support**: Unified API for classification, detection, captioning, VQA, and visual grounding. Task-specific target extraction is built-in. Supports "complete" or "all" task mode to load all task-specific metadata in a single pass.
 
 **Parallel Processing**: High-performance parallel version (`prepare_vrsbench_dataset_parallel()`) that processes samples 5-10x faster using streaming mode with ProcessPoolExecutor for true multi-core parallelism. Automatically detects Colab environment and uses optimal multiprocessing settings.
 
@@ -57,16 +57,19 @@ pip install -e .
 - Pillow >= 9.0
 - pandas >= 1.3
 - datasets >= 2.0.0 (required, for HuggingFace integration)
+- pyarrow >= 10.0.0 (optional, for Parquet support - 10-100x faster I/O)
 
 ## Core API
 
 The loader provides three main functions:
 
 1. **`prepare_vrsbench_dataset()`** - High-level function for dataset preparation (streaming mode)
-2. **`prepare_vrsbench_dataset_parallel()`** - Parallel version (5-10x faster, non-streaming mode)
+2. **`prepare_vrsbench_dataset_parallel()`** - Parallel version (5-10x faster, streaming + parallel processing)
 3. **`create_dataloader_from_prepared()`** - Creates PyTorch DataLoader from prepared data
 4. **`create_vrsbench_dataloader()`** - Convenience wrapper (calls prepare + create_dataloader)
 5. **`get_task_targets()`** - Extracts task-specific targets from metadata
+6. **`save_to_parquet()`** - Save prepared datasets to Parquet format (10-100x faster than JSON)
+7. **`load_from_parquet()`** - Load prepared datasets from Parquet format
 
 ## Quick Start
 
@@ -99,7 +102,7 @@ for images, metas in dataloader:
 
 ### Fast Usage (Parallel Mode - Recommended)
 
-```python
+   ```python
 from vrsbench_dataloader_production import (
     prepare_vrsbench_dataset_parallel,
     create_dataloader_from_prepared,
@@ -242,6 +245,34 @@ dataloader = create_dataloader_from_prepared(data, batch_size=16)
 for images, metas in dataloader:
     bboxes = get_task_targets(metas, task="grounding")
     # bboxes: List[List[float]] - [[x, y, w, h], ...] in pixel coordinates
+```
+
+### 6. Complete Data Loading (All Tasks)
+
+Load all task-specific metadata in a single pass for multi-task learning:
+
+```python
+data = prepare_vrsbench_dataset_parallel(
+    split="validation",
+    task="complete",  # or task="all" or task=None
+    num_samples=1000,
+    num_workers=8
+)
+
+# Access all task mappings
+image_to_caption = data["image_to_caption"]
+image_to_label = data["image_to_label"]
+image_to_qa_pairs = data["image_to_qa_pairs"]
+image_to_bboxes = data["image_to_bboxes"]
+
+dataloader = create_dataloader_from_prepared(data, batch_size=16)
+
+for images, metas in dataloader:
+    # All task data is available in each sample
+    captions = get_task_targets(metas, task="captioning")
+    labels = get_task_targets(metas, task="classification")
+    qa_pairs = get_task_targets(metas, task="vqa")
+    bboxes = get_task_targets(metas, task="detection")
 ```
 
 ## Performance Optimization
@@ -543,6 +574,8 @@ High-level parallel function to prepare VRSBench dataset (streaming + parallel p
 - `num_workers` (Optional[int]): Number of parallel workers (default: `min(32, os.cpu_count())` for multiprocessing, `min(8, os.cpu_count() * 2)` for threading)
 - `use_multiprocessing` (bool): Use ProcessPoolExecutor for true parallelism (default: True). Set False to use ThreadPoolExecutor (I/O-bound only)
 - `output_parquet` (Optional[str]): Path to save parquet file (optional, 10-100x faster than JSON)
+- `task` (str): Task type ("classification", "detection", "captioning", "vqa", "grounding", "complete", "all", or None)
+              If "all", "complete", or None, loads data for all tasks simultaneously
 
 **Returns:**
 - Same structure as `prepare_vrsbench_dataset()`
@@ -612,6 +645,30 @@ Extract task-specific targets from metadata batch.
 
 **Returns:**
 - Task-specific targets (labels, captions, QA pairs, bboxes)
+
+### `save_to_parquet()`
+
+Save prepared dataset to Parquet format (10-100x faster I/O than JSON).
+
+**Parameters:**
+- `data` (Dict[str, Any]): Output from `prepare_vrsbench_dataset()` or `prepare_vrsbench_dataset_parallel()`
+- `output_path` (str): Path to save parquet file (should end with .parquet)
+- `logger` (Optional[StructuredLogger]): Optional logger for messages
+
+**Note**: Complex types (lists, dicts, tuples) are automatically converted to JSON strings for Parquet compatibility. Metadata is saved separately as JSON.
+
+### `load_from_parquet()`
+
+Load prepared dataset from Parquet format.
+
+**Parameters:**
+- `parquet_path` (str): Path to parquet file
+- `logger` (Optional[StructuredLogger]): Optional logger for messages
+
+**Returns:**
+- Dictionary with same structure as `prepare_vrsbench_dataset()` output
+
+**Note**: JSON strings are automatically parsed back to complex types. Requires `pyarrow` to be installed.
 
 ### `VRSBenchConfig`
 
@@ -715,6 +772,12 @@ data = prepare_vrsbench_dataset_parallel(
 
 **Solution**: This is now fixed! The function uses a module-level worker function that can be pickled. If you still see errors, the function automatically falls back to ThreadPoolExecutor.
 
+### Repeated Images in Dataset
+
+**Problem**: Multiple samples are getting the same image path, but other metadata is unique.
+
+**Solution**: This is now fixed! The code now properly extracts image IDs from the dataset's `'image'` field (PIL Image objects with filename attribute, string paths, or dict formats). The problematic index-based fallback has been removed to ensure data integrity. Each sample is now correctly matched to its corresponding image file.
+
 ## Performance Benchmarks
 
 **Benchmarks** (NVIDIA V100, 32GB RAM, SSD, VRSBench validation set - 1,131 samples):
@@ -754,6 +817,13 @@ If you use this dataloader or VRSBench dataset, please cite:
 MIT License
 
 ## Changelog
+
+### Version 3.2.0 (2025-01-15) - Image Matching Fix & Complete Task Mode
+- 🐛 **Fixed Image Matching Bug** - Now properly extracts image IDs from dataset's `'image'` field (PIL Image objects, string paths, or dict formats)
+- 🐛 **Removed Index-Based Fallback** - Eliminated problematic index-based image assignment that caused repeated images
+- ✨ **Complete Task Mode** - Added support for `task="complete"` or `task="all"` to load all task-specific metadata in a single pass
+- 🐛 **Fixed Task Mapping Bug** - Corrected task mapping update logic to handle both "complete" and "all" task modes
+- 📝 **Improved Data Integrity** - Samples are now skipped if image matching fails, rather than assigning incorrect images
 
 ### Version 3.1.0 (2025-01-15) - Multiprocessing & Performance Improvements
 - ✨ **True Multi-Core Parallelism** - Uses ProcessPoolExecutor to bypass Python GIL and utilize all CPU cores

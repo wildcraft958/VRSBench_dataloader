@@ -2213,7 +2213,7 @@ def prepare_vrsbench_dataset_parallel(
                             
                             # OPTIMIZED: Update all task mappings (supports complete mode)
                             # Use if-elif only for single task mode, use separate ifs for complete mode
-                            if task == "complete":
+                            if task == "complete" or task == "all":
                                 # Update all available task mappings
                                 if "image_to_caption" in result["task_data"]:
                                     test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
@@ -2286,7 +2286,7 @@ def prepare_vrsbench_dataset_parallel(
                         test_data["id_to_path"].update(result["id_to_path"])
                         
                         # OPTIMIZED: Update all task mappings (supports complete mode)
-                        if task == "complete":
+                        if task == "complete" or task == "all":
                             # Update all available task mappings
                             if "image_to_caption" in result["task_data"]:
                                 test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
