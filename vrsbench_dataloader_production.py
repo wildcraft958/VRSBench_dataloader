@@ -122,7 +122,7 @@ class VRSBenchConfig:
         """
         if self.SUPPORTED_TASKS is None:
             # All supported vision-language tasks in VRSBench
-            self.SUPPORTED_TASKS = ["classification", "detection", "captioning", "vqa", "grounding"]
+            self.SUPPORTED_TASKS = ["classification", "detection", "captioning", "vqa", "grounding", "complete", "all"]
 
         # Create directories if they don't exist
         # exist_ok=True prevents errors if directories already exist
@@ -1483,14 +1483,17 @@ def _process_single_sample_mp(args):
         
         task_data = {}
         
-        # Extract task-specific targets
-        if task_mp == "all":
-            # Load all task data for complete data loading
+        # OPTIMIZED: Extract all task data in one pass for "complete" mode
+        if task_mp == "complete" or task_mp == "all":
+            # Extract all available task data efficiently
+            has_data = False
+            
             # Captioning
             caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
             if caption:
                 sample_info["caption"] = caption
                 task_data["image_to_caption"] = {image_id: caption}
+                has_data = True
             
             # Classification
             label = None
@@ -1501,16 +1504,16 @@ def _process_single_sample_mp(args):
             if label is not None:
                 sample_info["label"] = label
                 task_data["image_to_label"] = {image_id: label}
+                has_data = True
             
             # VQA
             qa_pairs = sample.get('qa_pairs', [])
+            if not qa_pairs and 'question' in sample and 'answer' in sample:
+                qa_pairs = [(sample['question'], sample['answer'])]
             if qa_pairs:
                 sample_info["qa_pairs"] = qa_pairs
                 task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
-            elif 'question' in sample and 'answer' in sample:
-                qa_pair = [(sample['question'], sample['answer'])]
-                sample_info["qa_pairs"] = qa_pair
-                task_data["image_to_qa_pairs"] = {image_id: qa_pair}
+                has_data = True
             
             # Detection/Grounding
             bboxes = []
@@ -1523,51 +1526,63 @@ def _process_single_sample_mp(args):
             if bboxes:
                 sample_info["bboxes"] = bboxes
                 task_data["image_to_bboxes"] = {image_id: bboxes}
-        elif task_mp == "captioning":
-            caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
-            sample_info["caption"] = caption
-            task_data["image_to_caption"] = {image_id: caption}
-        elif task_mp == "classification":
-            label = None
-            for key in ['label', 'category', 'class', 'target', 'class_id']:
-                if key in sample:
-                    label = sample[key]
-                    break
-            if label is not None:
-                sample_info["label"] = label
-                task_data["image_to_label"] = {image_id: label}
-            else:
-                return None
-        elif task_mp == "vqa":
-            qa_pairs = sample.get('qa_pairs', [])
-            if qa_pairs:
-                sample_info["qa_pairs"] = qa_pairs
-                task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
-            elif 'question' in sample and 'answer' in sample:
-                qa_pair = [(sample['question'], sample['answer'])]
-                sample_info["qa_pairs"] = qa_pair
-                task_data["image_to_qa_pairs"] = {image_id: qa_pair}
-            else:
-                return None
-        elif task_mp in ["detection", "grounding"]:
-            bboxes = []
-            if 'bbox' in sample:
-                bboxes = [sample['bbox']]
-            elif 'bboxes' in sample:
-                bboxes = sample['bboxes']
-            elif 'objects' in sample:
-                bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
-            if bboxes:
-                sample_info["bboxes"] = bboxes
-                task_data["image_to_bboxes"] = {image_id: bboxes}
-            else:
-                return None
+                has_data = True
+            
+            # Always include sample if image exists (even if no task data)
+            # Add all other fields
+            for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
+                       'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
+                if key in sample and key not in sample_info:
+                    sample_info[key] = sample[key]
         
-        # Add all other fields
-        for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
-                   'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
-            if key in sample and key not in sample_info:
-                sample_info[key] = sample[key]
+        # Single task mode (original behavior - faster, filters samples)
+        else:
+            # Extract task-specific targets
+            if task_mp == "captioning":
+                caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
+                sample_info["caption"] = caption
+                task_data["image_to_caption"] = {image_id: caption}
+            elif task_mp == "classification":
+                label = None
+                for key in ['label', 'category', 'class', 'target', 'class_id']:
+                    if key in sample:
+                        label = sample[key]
+                        break
+                if label is not None:
+                    sample_info["label"] = label
+                    task_data["image_to_label"] = {image_id: label}
+                else:
+                    return None  # Skip if no label
+            elif task_mp == "vqa":
+                qa_pairs = sample.get('qa_pairs', [])
+                if qa_pairs:
+                    sample_info["qa_pairs"] = qa_pairs
+                    task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
+                elif 'question' in sample and 'answer' in sample:
+                    qa_pair = [(sample['question'], sample['answer'])]
+                    sample_info["qa_pairs"] = qa_pair
+                    task_data["image_to_qa_pairs"] = {image_id: qa_pair}
+                else:
+                    return None  # Skip if no QA pairs
+            elif task_mp in ["detection", "grounding"]:
+                bboxes = []
+                if 'bbox' in sample:
+                    bboxes = [sample['bbox']]
+                elif 'bboxes' in sample:
+                    bboxes = sample['bboxes']
+                elif 'objects' in sample:
+                    bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+                if bboxes:
+                    sample_info["bboxes"] = bboxes
+                    task_data["image_to_bboxes"] = {image_id: bboxes}
+                else:
+                    return None  # Skip if no bboxes
+            
+            # Add all other fields
+            for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
+                       'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
+                if key in sample and key not in sample_info:
+                    sample_info[key] = sample[key]
         
         return {
             "sample_info": sample_info,
@@ -1682,6 +1697,10 @@ def prepare_vrsbench_dataset_parallel(
         # Validate task
         if task not in config.SUPPORTED_TASKS:
             raise ValueError(f"Unsupported task: {task}. Choose from {config.SUPPORTED_TASKS} or 'all'")
+    
+    # Normalize task name
+    if task == "all":
+        task = "complete"
     
     # Set optimal worker count if not provided
     if num_workers is None:
@@ -1931,14 +1950,17 @@ def prepare_vrsbench_dataset_parallel(
             
             task_data = {}
             
-            # Extract task-specific targets
-            if load_all_tasks:
-                # Load all task data for complete data loading
+            # OPTIMIZED: Extract all task data in one pass for "complete" mode
+            if task == "complete" or task == "all":
+                # Extract all available task data efficiently
+                has_data = False
+                
                 # Captioning
                 caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
                 if caption:
                     sample_info["caption"] = caption
                     task_data["image_to_caption"] = {image_id: caption}
+                    has_data = True
                 
                 # Classification
                 label = None
@@ -1949,16 +1971,16 @@ def prepare_vrsbench_dataset_parallel(
                 if label is not None:
                     sample_info["label"] = label
                     task_data["image_to_label"] = {image_id: label}
+                    has_data = True
                 
                 # VQA
                 qa_pairs = sample.get('qa_pairs', [])
+                if not qa_pairs and 'question' in sample and 'answer' in sample:
+                    qa_pairs = [(sample['question'], sample['answer'])]
                 if qa_pairs:
                     sample_info["qa_pairs"] = qa_pairs
                     task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
-                elif 'question' in sample and 'answer' in sample:
-                    qa_pair = [(sample['question'], sample['answer'])]
-                    sample_info["qa_pairs"] = qa_pair
-                    task_data["image_to_qa_pairs"] = {image_id: qa_pair}
+                    has_data = True
                 
                 # Detection/Grounding
                 bboxes = []
@@ -1971,52 +1993,64 @@ def prepare_vrsbench_dataset_parallel(
                 if bboxes:
                     sample_info["bboxes"] = bboxes
                     task_data["image_to_bboxes"] = {image_id: bboxes}
-            elif task == "captioning":
-                caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
-                sample_info["caption"] = caption
-                task_data["image_to_caption"] = {image_id: caption}
-            elif task == "classification":
-                # Try to find label
-                label = None
-                for key in ['label', 'category', 'class', 'target', 'class_id']:
-                    if key in sample:
-                        label = sample[key]
-                        break
-                if label is not None:
-                    sample_info["label"] = label
-                    task_data["image_to_label"] = {image_id: label}
-                else:
-                    return None
-            elif task == "vqa":
-                qa_pairs = sample.get('qa_pairs', [])
-                if qa_pairs:
-                    sample_info["qa_pairs"] = qa_pairs
-                    task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
-                elif 'question' in sample and 'answer' in sample:
-                    qa_pair = [(sample['question'], sample['answer'])]
-                    sample_info["qa_pairs"] = qa_pair
-                    task_data["image_to_qa_pairs"] = {image_id: qa_pair}
-                else:
-                    return None
-            elif task in ["detection", "grounding"]:
-                bboxes = []
-                if 'bbox' in sample:
-                    bboxes = [sample['bbox']]
-                elif 'bboxes' in sample:
-                    bboxes = sample['bboxes']
-                elif 'objects' in sample:
-                    bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
-                if bboxes:
-                    sample_info["bboxes"] = bboxes
-                    task_data["image_to_bboxes"] = {image_id: bboxes}
-                else:
-                    return None
+                    has_data = True
+                
+                # Always include sample if image exists (even if no task data)
+                # Add all other fields
+                for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
+                           'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
+                    if key in sample and key not in sample_info:
+                        sample_info[key] = sample[key]
             
-            # Add all other fields from dataset
-            for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
-                       'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
-                if key in sample and key not in sample_info:
-                    sample_info[key] = sample[key]
+            # Single task mode (original behavior - faster, filters samples)
+            else:
+                # Extract task-specific targets
+                if task == "captioning":
+                    caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
+                    sample_info["caption"] = caption
+                    task_data["image_to_caption"] = {image_id: caption}
+                elif task == "classification":
+                    # Try to find label
+                    label = None
+                    for key in ['label', 'category', 'class', 'target', 'class_id']:
+                        if key in sample:
+                            label = sample[key]
+                            break
+                    if label is not None:
+                        sample_info["label"] = label
+                        task_data["image_to_label"] = {image_id: label}
+                    else:
+                        return None
+                elif task == "vqa":
+                    qa_pairs = sample.get('qa_pairs', [])
+                    if qa_pairs:
+                        sample_info["qa_pairs"] = qa_pairs
+                        task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
+                    elif 'question' in sample and 'answer' in sample:
+                        qa_pair = [(sample['question'], sample['answer'])]
+                        sample_info["qa_pairs"] = qa_pair
+                        task_data["image_to_qa_pairs"] = {image_id: qa_pair}
+                    else:
+                        return None
+                elif task in ["detection", "grounding"]:
+                    bboxes = []
+                    if 'bbox' in sample:
+                        bboxes = [sample['bbox']]
+                    elif 'bboxes' in sample:
+                        bboxes = sample['bboxes']
+                    elif 'objects' in sample:
+                        bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+                    if bboxes:
+                        sample_info["bboxes"] = bboxes
+                        task_data["image_to_bboxes"] = {image_id: bboxes}
+                    else:
+                        return None
+                
+                # Add all other fields from dataset
+                for key in ['objects', 'attributes', 'relationships', 'question', 'answer', 
+                           'bbox', 'bboxes', 'category', 'label', 'caption', 'description', 'text']:
+                    if key in sample and key not in sample_info:
+                        sample_info[key] = sample[key]
             
             return {
                 "sample_info": sample_info,
@@ -2085,15 +2119,28 @@ def prepare_vrsbench_dataset_parallel(
                             test_data["samples"].append(result["sample_info"])
                             test_data["id_to_path"].update(result["id_to_path"])
                             
-                            # Update task-specific mappings
-                            if "image_to_caption" in result["task_data"]:
-                                test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
-                            elif "image_to_label" in result["task_data"]:
-                                test_data["image_to_label"].update(result["task_data"]["image_to_label"])
-                            elif "image_to_qa_pairs" in result["task_data"]:
-                                test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
-                            elif "image_to_bboxes" in result["task_data"]:
-                                test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
+                            # OPTIMIZED: Update all task mappings (supports complete mode)
+                            # Use if-elif only for single task mode, use separate ifs for complete mode
+                            if task == "complete":
+                                # Update all available task mappings
+                                if "image_to_caption" in result["task_data"]:
+                                    test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
+                                if "image_to_label" in result["task_data"]:
+                                    test_data["image_to_label"].update(result["task_data"]["image_to_label"])
+                                if "image_to_qa_pairs" in result["task_data"]:
+                                    test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
+                                if "image_to_bboxes" in result["task_data"]:
+                                    test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
+                            else:
+                                # Single task mode - update only the relevant mapping
+                                if "image_to_caption" in result["task_data"]:
+                                    test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
+                                elif "image_to_label" in result["task_data"]:
+                                    test_data["image_to_label"].update(result["task_data"]["image_to_label"])
+                                elif "image_to_qa_pairs" in result["task_data"]:
+                                    test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
+                                elif "image_to_bboxes" in result["task_data"]:
+                                    test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
                             
                             count += 1
                         else:
@@ -2146,15 +2193,27 @@ def prepare_vrsbench_dataset_parallel(
                         test_data["samples"].append(result["sample_info"])
                         test_data["id_to_path"].update(result["id_to_path"])
                         
-                        # Update task-specific mappings
-                        if "image_to_caption" in result["task_data"]:
-                            test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
-                        elif "image_to_label" in result["task_data"]:
-                            test_data["image_to_label"].update(result["task_data"]["image_to_label"])
-                        elif "image_to_qa_pairs" in result["task_data"]:
-                            test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
-                        elif "image_to_bboxes" in result["task_data"]:
-                            test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
+                        # OPTIMIZED: Update all task mappings (supports complete mode)
+                        if task == "complete":
+                            # Update all available task mappings
+                            if "image_to_caption" in result["task_data"]:
+                                test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
+                            if "image_to_label" in result["task_data"]:
+                                test_data["image_to_label"].update(result["task_data"]["image_to_label"])
+                            if "image_to_qa_pairs" in result["task_data"]:
+                                test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
+                            if "image_to_bboxes" in result["task_data"]:
+                                test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
+                        else:
+                            # Single task mode - update only the relevant mapping
+                            if "image_to_caption" in result["task_data"]:
+                                test_data["image_to_caption"].update(result["task_data"]["image_to_caption"])
+                            elif "image_to_label" in result["task_data"]:
+                                test_data["image_to_label"].update(result["task_data"]["image_to_label"])
+                            elif "image_to_qa_pairs" in result["task_data"]:
+                                test_data["image_to_qa_pairs"].update(result["task_data"]["image_to_qa_pairs"])
+                            elif "image_to_bboxes" in result["task_data"]:
+                                test_data["image_to_bboxes"].update(result["task_data"]["image_to_bboxes"])
                         
                         count += 1
                     else:
