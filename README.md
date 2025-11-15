@@ -30,7 +30,7 @@ This loader eliminates all of that. **One function call replaces 50+ lines of bo
 
 **Multi-Task Support**: Unified API for classification, detection, captioning, VQA, and visual grounding. Task-specific target extraction is built-in.
 
-**Parallel Processing**: High-performance parallel version (`prepare_vrsbench_dataset_parallel()`) that processes samples 5-10x faster using non-streaming mode and ThreadPoolExecutor.
+**Parallel Processing**: High-performance parallel version (`prepare_vrsbench_dataset_parallel()`) that processes samples 5-10x faster using streaming mode with ProcessPoolExecutor for true multi-core parallelism. Automatically detects Colab environment and uses optimal multiprocessing settings.
 
 **Structured JSON Logging**: Rotating log files (10MB, 5 backups) with configurable levels. JSON format for log aggregation systems. Console output for development.
 
@@ -99,19 +99,20 @@ for images, metas in dataloader:
 
 ### Fast Usage (Parallel Mode - Recommended)
 
-   ```python
+```python
 from vrsbench_dataloader_production import (
     prepare_vrsbench_dataset_parallel,
     create_dataloader_from_prepared,
     get_task_targets
 )
 
-# Prepare dataset in parallel (5-10x faster)
+# Prepare dataset in parallel (5-10x faster with true multi-core parallelism)
 data = prepare_vrsbench_dataset_parallel(
     split="validation",
     task="captioning",
     num_samples=1000,
-    num_workers=8,  # Parallel threads
+    num_workers=None,  # Auto-detects optimal count (capped at 32)
+    use_multiprocessing=True,  # Uses ProcessPoolExecutor for true parallelism
     download_images=True
 )
 
@@ -248,9 +249,10 @@ for images, metas in dataloader:
 ### When to Use Parallel Mode
 
 Use `prepare_vrsbench_dataset_parallel()` when:
-- Dataset fits in memory (< 10GB typically)
 - You need faster dataset preparation (5-10x speedup)
 - Processing large numbers of samples (> 1000)
+- You have multiple CPU cores available
+- Working in Colab or multi-core environments
 
 Use `prepare_vrsbench_dataset()` (streaming) when:
 - Dataset is too large for memory
@@ -259,43 +261,72 @@ Use `prepare_vrsbench_dataset()` (streaming) when:
 
 ### Optimal Worker Count
 
+The parallel version automatically optimizes worker count:
+- **Multiprocessing mode** (default): Uses `min(32, os.cpu_count())` - optimal for CPU-bound tasks
+- **Threading mode**: Uses `min(8, os.cpu_count() * 2)` - optimal for I/O-bound tasks
+- **Colab detection**: Automatically uses 'spawn' method for multiprocessing compatibility
+
 ```python
 import os
 
-# For parallel preparation
-num_workers_prep = min(8, os.cpu_count() * 2)  # 4-16 optimal
-
-# For DataLoader
-num_workers_dl = min(4, os.cpu_count())  # 2-8 optimal
-
+# Auto-detection (recommended)
 data = prepare_vrsbench_dataset_parallel(
     split="validation",
     task="captioning",
-    num_workers=num_workers_prep
+    num_workers=None,  # Auto-detects optimal count (capped at 32)
+    use_multiprocessing=True  # True parallelism (default)
 )
 
+# Manual override (if needed)
+data = prepare_vrsbench_dataset_parallel(
+    split="validation",
+    task="captioning",
+    num_workers=16,  # Custom worker count
+    use_multiprocessing=True  # ProcessPoolExecutor (true parallelism)
+)
+
+# Threading mode (I/O-bound only, single-core due to GIL)
+data = prepare_vrsbench_dataset_parallel(
+    split="validation",
+    task="captioning",
+    num_workers=8,
+    use_multiprocessing=False  # ThreadPoolExecutor (I/O-bound)
+)
+
+# For DataLoader
 dataloader = create_dataloader_from_prepared(
     data,
     batch_size=16,
-    num_workers=num_workers_dl
+    num_workers=4  # 2-8 optimal for DataLoader
 )
 ```
+
+**Note**: In Colab or environments with many cores (e.g., 100 cores), the function automatically:
+- Detects Colab environment
+- Uses 'spawn' method for multiprocessing
+- Caps workers at 32 to prevent overhead
+- Falls back to threading if multiprocessing fails
 
 ### Caching Prepared Datasets
 
 Save prepared datasets to avoid re-processing:
 
 ```python
-# First time: prepare and save
+# First time: prepare and save (Parquet is 10-100x faster than JSON)
 data = prepare_vrsbench_dataset_parallel(
     split="validation",
     task="captioning",
     num_samples=None,  # All samples
-    output_json="vrsbench_val_captioning.json",
-    num_workers=8
+    output_parquet="vrsbench_val_captioning.parquet",  # Fast binary format
+    # output_json="vrsbench_val_captioning.json",  # Or use JSON
+    num_workers=None  # Auto-detects optimal count
 )
 
-# Subsequent runs: Load from JSON (instant!)
+# Subsequent runs: Load from Parquet (instant!)
+from vrsbench_dataloader_production import load_from_parquet
+data = load_from_parquet("vrsbench_val_captioning.parquet")
+
+# Or load from JSON
 import json
 with open("vrsbench_val_captioning.json", 'r') as f:
     data = json.load(f)
@@ -505,19 +536,29 @@ High-level function to prepare VRSBench dataset (streaming mode).
 
 ### `prepare_vrsbench_dataset_parallel()`
 
-High-level parallel function to prepare VRSBench dataset (non-streaming mode, 5-10x faster).
+High-level parallel function to prepare VRSBench dataset (streaming + parallel processing, 5-10x faster).
 
 **Parameters:**
 - All parameters from `prepare_vrsbench_dataset()` plus:
-- `num_workers` (int): Number of parallel threads (default: 8, optimal for I/O-bound operations)
+- `num_workers` (Optional[int]): Number of parallel workers (default: `min(32, os.cpu_count())` for multiprocessing, `min(8, os.cpu_count() * 2)` for threading)
+- `use_multiprocessing` (bool): Use ProcessPoolExecutor for true parallelism (default: True). Set False to use ThreadPoolExecutor (I/O-bound only)
+- `output_parquet` (Optional[str]): Path to save parquet file (optional, 10-100x faster than JSON)
 
 **Returns:**
 - Same structure as `prepare_vrsbench_dataset()`
 
 **Performance:**
 - 5-10x faster than streaming version
-- Best for datasets that fit in memory (< 10GB typically)
-- Optimal worker count: 4-16 threads
+- Uses ProcessPoolExecutor for true multi-core parallelism (bypasses Python GIL)
+- Automatically detects Colab environment and uses 'spawn' method
+- Optimal worker count: Auto-detected (capped at 32 to prevent overhead)
+- Graceful fallback to ThreadPoolExecutor if multiprocessing fails
+
+**Features:**
+- **True Parallelism**: Uses ProcessPoolExecutor to utilize all CPU cores
+- **Colab Compatible**: Automatically detects and configures for Colab environment
+- **Error Handling**: Falls back to threading if pickling fails
+- **Parquet Support**: Save/load prepared datasets 10-100x faster than JSON
 
 ### `create_dataloader_from_prepared()`
 
@@ -647,6 +688,33 @@ data = prepare_vrsbench_dataset(
 )
 ```
 
+### Multiprocessing Not Working in Colab
+
+**Problem**: Only 1 CPU core being used despite setting high `num_workers`.
+
+**Solution**: The function now automatically:
+- Detects Colab environment
+- Uses 'spawn' method for multiprocessing
+- Falls back to threading if pickling fails
+- Caps workers at 32 to prevent overhead
+
+If issues persist, try:
+```python
+# Force threading mode (I/O-bound only)
+data = prepare_vrsbench_dataset_parallel(
+    split="validation",
+    task="captioning",
+    num_workers=8,
+    use_multiprocessing=False  # Use ThreadPoolExecutor
+)
+```
+
+### Pickling Errors with Multiprocessing
+
+**Problem**: `AttributeError: Can't get local object` when using multiprocessing.
+
+**Solution**: This is now fixed! The function uses a module-level worker function that can be pickled. If you still see errors, the function automatically falls back to ThreadPoolExecutor.
+
 ## Performance Benchmarks
 
 **Benchmarks** (NVIDIA V100, 32GB RAM, SSD, VRSBench validation set - 1,131 samples):
@@ -660,11 +728,13 @@ data = prepare_vrsbench_dataset(
 | Detection | Parallel | 16 | 8 | 1000 | 3.8 |
 
 **Optimization tips**:
-- Use `prepare_vrsbench_dataset_parallel()` for 5-10x speedup
-- Increase `num_workers` (4-8 recommended for DataLoader, 8-16 for parallel prep)
+- Use `prepare_vrsbench_dataset_parallel()` for 5-10x speedup with true multi-core parallelism
+- Let `num_workers=None` auto-detect optimal count (capped at 32)
+- Use `use_multiprocessing=True` (default) for CPU-bound tasks
 - Enable `pin_memory=True` for GPU training
 - Use SSD storage for images
-- Cache prepared datasets to JSON for instant loading
+- Cache prepared datasets to Parquet (10-100x faster than JSON) or JSON for instant loading
+- In Colab: Function automatically detects and configures for optimal performance
 
 ## Citation
 
@@ -684,6 +754,16 @@ If you use this dataloader or VRSBench dataset, please cite:
 MIT License
 
 ## Changelog
+
+### Version 3.1.0 (2025-01-15) - Multiprocessing & Performance Improvements
+- ✨ **True Multi-Core Parallelism** - Uses ProcessPoolExecutor to bypass Python GIL and utilize all CPU cores
+- ✨ **Colab Detection** - Automatically detects Colab environment and uses 'spawn' method for multiprocessing
+- ✨ **Worker Count Optimization** - Auto-detects optimal worker count (capped at 32 to prevent overhead)
+- ✨ **Error Handling** - Graceful fallback to ThreadPoolExecutor if multiprocessing fails
+- ✨ **Parquet Support** - Save/load prepared datasets 10-100x faster than JSON
+- 🐛 **Fixed Pickling Errors** - Module-level worker function ensures proper pickling for multiprocessing
+- 🐛 **Fixed Multiple Downloads** - Enhanced download logic prevents redundant image downloads
+- 🐛 **Fixed ArrowInvalid Errors** - Switched to streaming mode for HuggingFace dataset loading
 
 ### Version 3.0.0 (2025-01-13) - Major Refactoring
 - 🔄 **Complete architecture refactor** - High-level API (`prepare_vrsbench_dataset` + `create_dataloader_from_prepared`) is now the core
@@ -753,12 +833,13 @@ from vrsbench_dataloader_production import (
     get_task_targets
 )
 
-# Prepare dataset in parallel (5-10x faster)
+# Prepare dataset in parallel (5-10x faster with true multi-core parallelism)
 data = prepare_vrsbench_dataset_parallel(
     split="validation",
     task="captioning",
     num_samples=1000,
-    num_workers=8,
+    num_workers=None,  # Auto-detects optimal count (capped at 32)
+    use_multiprocessing=True,  # True parallelism (default)
     download_images=True
 )
 

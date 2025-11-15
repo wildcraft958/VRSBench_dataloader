@@ -856,7 +856,7 @@ def load_from_parquet(parquet_path: str, logger: Optional['StructuredLogger'] = 
 # ========================= DataLoader Factory =========================
 
 def create_vrsbench_dataloader(
-    task: str = "classification",
+    task: Union[str, None] = "classification",
     split: str = "validation",
     images_dir: Optional[str] = None,
     num_samples: Optional[int] = None,
@@ -880,7 +880,8 @@ def create_vrsbench_dataloader(
     Uses HuggingFace streaming datasets as the primary and only workflow.
 
     Args:
-        task: Task type (classification, detection, captioning, vqa, grounding)
+        task: Task type (classification, detection, captioning, vqa, grounding, "all", or None)
+              If "all" or None, loads data for all tasks simultaneously
         split: Dataset split (train/validation/test)
         images_dir: Directory to store images (default: ./Images_{split})
         num_samples: Limit number of samples (None = all)
@@ -983,7 +984,7 @@ def get_task_targets(
 
 def prepare_vrsbench_dataset(
     split: str = "validation",
-    task: str = "captioning",
+    task: Union[str, None] = "captioning",
     images_dir: Optional[str] = None,
     num_samples: Optional[int] = None,
     hf_dataset_name: str = "xiang709/VRSBench",
@@ -1013,7 +1014,8 @@ def prepare_vrsbench_dataset(
     
     Args:
         split: Dataset split ("train" or "validation")
-        task: Task type ("classification", "detection", "captioning", "vqa", "grounding")
+        task: Task type ("classification", "detection", "captioning", "vqa", "grounding", "all", or None)
+              If "all" or None, loads data for all tasks simultaneously
         images_dir: Directory to store images (default: ./Images_{split})
         num_samples: Limit number of samples (None = all)
         hf_dataset_name: HuggingFace dataset identifier
@@ -1028,9 +1030,10 @@ def prepare_vrsbench_dataset(
         Dictionary with:
         - "samples": List of sample dicts with image_path and task-specific metadata
         - Task-specific mappings (e.g., "image_to_caption" for captioning, "image_to_label" for classification)
+          When task="all", all mappings are included
         - "id_to_path": Dict mapping image_id -> image_path
         - "split": Dataset split used
-        - "task": Task type used
+        - "task": Task type used ("all" if loading all tasks)
         - "num_samples": Number of samples loaded
     
     Example:
@@ -1045,6 +1048,10 @@ def prepare_vrsbench_dataset(
         >>> # For VQA task
         >>> data = prepare_vrsbench_dataset(split="validation", task="vqa", num_samples=1000)
         >>> # Access qa_pairs from samples
+        >>> 
+        >>> # For all tasks (complete data loading)
+        >>> data = prepare_vrsbench_dataset(split="validation", task="all", num_samples=1000)
+        >>> # Access all mappings: image_to_caption, image_to_label, image_to_qa_pairs, image_to_bboxes
     """
     if not HAS_DATASETS:
         raise ImportError(
@@ -1053,11 +1060,19 @@ def prepare_vrsbench_dataset(
     
     config = config or VRSBenchConfig()
     
-    # Validate task
-    if task not in config.SUPPORTED_TASKS:
-        raise ValueError(f"Unsupported task: {task}. Choose from {config.SUPPORTED_TASKS}")
+    # Handle "all" tasks mode
+    load_all_tasks = (task is None or task == "all")
+    if load_all_tasks:
+        task = "all"
     
     logger = StructuredLogger("VRSBenchWorkflow", config)
+    if load_all_tasks:
+        logger.info("Loading data for all tasks (complete data loading mode)")
+    else:
+        # Validate task
+        if task not in config.SUPPORTED_TASKS:
+            raise ValueError(f"Unsupported task: {task}. Choose from {config.SUPPORTED_TASKS} or 'all'")
+    
     metrics = MetricsCollector()
     download_mgr = DownloadManager(config, logger, metrics)
     task_processor = TaskProcessor()
@@ -1160,7 +1175,13 @@ def prepare_vrsbench_dataset(
     }
     
     # Add task-specific mapping keys
-    if task == "captioning":
+    if load_all_tasks:
+        # Initialize all task mappings for complete data loading
+        test_data["image_to_caption"] = {}
+        test_data["image_to_label"] = {}
+        test_data["image_to_qa_pairs"] = {}
+        test_data["image_to_bboxes"] = {}
+    elif task == "captioning":
         test_data["image_to_caption"] = {}
     elif task == "classification":
         test_data["image_to_label"] = {}
@@ -1272,7 +1293,46 @@ def prepare_vrsbench_dataset(
                     }
                     
                     # Extract task-specific targets
-                    if task == "captioning":
+                    if load_all_tasks:
+                        # Load all task data for complete data loading
+                        # Captioning
+                        caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
+                        if caption:
+                            sample_info["caption"] = caption
+                            test_data["image_to_caption"][image_id] = caption
+                        
+                        # Classification
+                        label = None
+                        for key in ['label', 'category', 'class', 'target', 'class_id']:
+                            if key in sample:
+                                label = sample[key]
+                                break
+                        if label is not None:
+                            sample_info["label"] = label
+                            test_data["image_to_label"][image_id] = label
+                        
+                        # VQA
+                        qa_pairs = sample.get('qa_pairs', [])
+                        if qa_pairs:
+                            sample_info["qa_pairs"] = qa_pairs
+                            test_data["image_to_qa_pairs"][image_id] = qa_pairs
+                        elif 'question' in sample and 'answer' in sample:
+                            qa_pair = [(sample['question'], sample['answer'])]
+                            sample_info["qa_pairs"] = qa_pair
+                            test_data["image_to_qa_pairs"][image_id] = qa_pair
+                        
+                        # Detection/Grounding
+                        bboxes = []
+                        if 'bbox' in sample:
+                            bboxes = [sample['bbox']]
+                        elif 'bboxes' in sample:
+                            bboxes = sample['bboxes']
+                        elif 'objects' in sample:
+                            bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+                        if bboxes:
+                            sample_info["bboxes"] = bboxes
+                            test_data["image_to_bboxes"][image_id] = bboxes
+                    elif task == "captioning":
                         caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
                         sample_info["caption"] = caption
                         test_data["image_to_caption"][image_id] = caption
@@ -1424,7 +1484,46 @@ def _process_single_sample_mp(args):
         task_data = {}
         
         # Extract task-specific targets
-        if task_mp == "captioning":
+        if task_mp == "all":
+            # Load all task data for complete data loading
+            # Captioning
+            caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
+            if caption:
+                sample_info["caption"] = caption
+                task_data["image_to_caption"] = {image_id: caption}
+            
+            # Classification
+            label = None
+            for key in ['label', 'category', 'class', 'target', 'class_id']:
+                if key in sample:
+                    label = sample[key]
+                    break
+            if label is not None:
+                sample_info["label"] = label
+                task_data["image_to_label"] = {image_id: label}
+            
+            # VQA
+            qa_pairs = sample.get('qa_pairs', [])
+            if qa_pairs:
+                sample_info["qa_pairs"] = qa_pairs
+                task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
+            elif 'question' in sample and 'answer' in sample:
+                qa_pair = [(sample['question'], sample['answer'])]
+                sample_info["qa_pairs"] = qa_pair
+                task_data["image_to_qa_pairs"] = {image_id: qa_pair}
+            
+            # Detection/Grounding
+            bboxes = []
+            if 'bbox' in sample:
+                bboxes = [sample['bbox']]
+            elif 'bboxes' in sample:
+                bboxes = sample['bboxes']
+            elif 'objects' in sample:
+                bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+            if bboxes:
+                sample_info["bboxes"] = bboxes
+                task_data["image_to_bboxes"] = {image_id: bboxes}
+        elif task_mp == "captioning":
             caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
             sample_info["caption"] = caption
             task_data["image_to_caption"] = {image_id: caption}
@@ -1482,7 +1581,7 @@ def _process_single_sample_mp(args):
 
 def prepare_vrsbench_dataset_parallel(
     split: str = "validation",
-    task: str = "captioning",
+    task: Union[str, None] = "captioning",
     images_dir: Optional[str] = None,
     num_samples: Optional[int] = None,
     hf_dataset_name: str = "xiang709/VRSBench",
@@ -1519,7 +1618,8 @@ def prepare_vrsbench_dataset_parallel(
     
     Args:
         split: Dataset split ("train" or "validation")
-        task: Task type ("classification", "detection", "captioning", "vqa", "grounding")
+        task: Task type ("classification", "detection", "captioning", "vqa", "grounding", "all", or None)
+              If "all" or None, loads data for all tasks simultaneously
         images_dir: Directory to store images (default: ./Images_{split})
         num_samples: Limit number of samples (None = all)
         hf_dataset_name: HuggingFace dataset identifier
@@ -1530,7 +1630,7 @@ def prepare_vrsbench_dataset_parallel(
         output_parquet: Path to save parquet file (optional, 10-100x faster than JSON)
         config: Configuration object (optional)
         force_download: Force re-download even if images exist
-        num_workers: Number of parallel workers (default: os.cpu_count() for multiprocessing, 8 for threading)
+        num_workers: Number of parallel workers (default: min(32, os.cpu_count()) for multiprocessing, min(8, os.cpu_count() * 2) for threading)
         use_multiprocessing: Use ProcessPoolExecutor for true parallelism (default: True)
                              Set False to use ThreadPoolExecutor (I/O-bound only)
     
@@ -1538,9 +1638,10 @@ def prepare_vrsbench_dataset_parallel(
         Dictionary with:
         - "samples": List of sample dicts with image_path and task-specific metadata
         - Task-specific mappings (e.g., "image_to_caption" for captioning, "image_to_label" for classification)
+          When task="all", all mappings are included
         - "id_to_path": Dict mapping image_id -> image_path
         - "split": Dataset split used
-        - "task": Task type used
+        - "task": Task type used ("all" if loading all tasks)
         - "num_samples": Number of samples loaded
     
     Example:
@@ -1569,9 +1670,18 @@ def prepare_vrsbench_dataset_parallel(
     
     config = config or VRSBenchConfig()
     
-    # Validate task
-    if task not in config.SUPPORTED_TASKS:
-        raise ValueError(f"Unsupported task: {task}. Choose from {config.SUPPORTED_TASKS}")
+    # Handle "all" tasks mode
+    load_all_tasks = (task is None or task == "all")
+    if load_all_tasks:
+        task = "all"
+    
+    logger = StructuredLogger("VRSBenchWorkflowParallel", config)
+    if load_all_tasks:
+        logger.info("Loading data for all tasks (complete data loading mode)")
+    else:
+        # Validate task
+        if task not in config.SUPPORTED_TASKS:
+            raise ValueError(f"Unsupported task: {task}. Choose from {config.SUPPORTED_TASKS} or 'all'")
     
     # Set optimal worker count if not provided
     if num_workers is None:
@@ -1720,7 +1830,13 @@ def prepare_vrsbench_dataset_parallel(
     }
     
     # Add task-specific mapping keys
-    if task == "captioning":
+    if load_all_tasks:
+        # Initialize all task mappings for complete data loading
+        test_data["image_to_caption"] = {}
+        test_data["image_to_label"] = {}
+        test_data["image_to_qa_pairs"] = {}
+        test_data["image_to_bboxes"] = {}
+    elif task == "captioning":
         test_data["image_to_caption"] = {}
     elif task == "classification":
         test_data["image_to_label"] = {}
@@ -1816,7 +1932,46 @@ def prepare_vrsbench_dataset_parallel(
             task_data = {}
             
             # Extract task-specific targets
-            if task == "captioning":
+            if load_all_tasks:
+                # Load all task data for complete data loading
+                # Captioning
+                caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
+                if caption:
+                    sample_info["caption"] = caption
+                    task_data["image_to_caption"] = {image_id: caption}
+                
+                # Classification
+                label = None
+                for key in ['label', 'category', 'class', 'target', 'class_id']:
+                    if key in sample:
+                        label = sample[key]
+                        break
+                if label is not None:
+                    sample_info["label"] = label
+                    task_data["image_to_label"] = {image_id: label}
+                
+                # VQA
+                qa_pairs = sample.get('qa_pairs', [])
+                if qa_pairs:
+                    sample_info["qa_pairs"] = qa_pairs
+                    task_data["image_to_qa_pairs"] = {image_id: qa_pairs}
+                elif 'question' in sample and 'answer' in sample:
+                    qa_pair = [(sample['question'], sample['answer'])]
+                    sample_info["qa_pairs"] = qa_pair
+                    task_data["image_to_qa_pairs"] = {image_id: qa_pair}
+                
+                # Detection/Grounding
+                bboxes = []
+                if 'bbox' in sample:
+                    bboxes = [sample['bbox']]
+                elif 'bboxes' in sample:
+                    bboxes = sample['bboxes']
+                elif 'objects' in sample:
+                    bboxes = [obj.get('bbox', []) for obj in sample['objects'] if 'bbox' in obj]
+                if bboxes:
+                    sample_info["bboxes"] = bboxes
+                    task_data["image_to_bboxes"] = {image_id: bboxes}
+            elif task == "captioning":
                 caption = sample.get('caption', '') or sample.get('description', '') or sample.get('text', '')
                 sample_info["caption"] = caption
                 task_data["image_to_caption"] = {image_id: caption}
