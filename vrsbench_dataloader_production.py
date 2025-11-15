@@ -34,7 +34,6 @@ import logging
 from logging.handlers import RotatingFileHandler
 import requests
 from tqdm import tqdm
-import pandas as pd
 from PIL import Image
 import torch
 from torch.utils.data import IterableDataset, DataLoader
@@ -44,7 +43,7 @@ import threading
 
 # Optional dependencies - HuggingFace datasets library
 # This library provides better performance for large datasets and seamless integration
-# with HuggingFace Hub. If not available, the code falls back to pandas-based processing.
+# with HuggingFace Hub. Required for prepare_vrsbench_dataset() functions.
 try:
     from datasets import load_dataset, Dataset
     HAS_DATASETS = True
@@ -868,7 +867,7 @@ def prepare_vrsbench_dataset(
     hf_token: Optional[str] = None,
     download_images: bool = True,
     images_url: Optional[str] = None,
-    output_json: Optional[str] = None,
+    output_json: Union[Optional[str], bool] = None,
     config: Optional[VRSBenchConfig] = None,
     force_download: bool = False
 ) -> Dict[str, Any]:
@@ -946,7 +945,7 @@ def prepare_vrsbench_dataset(
     
     os.makedirs(images_dir, exist_ok=True)
     
-    # Download images if needed
+    # Download images if needed (improved logic to prevent multiple downloads)
     if download_images:
         # Auto-detect image URL based on split
         if images_url is None:
@@ -957,25 +956,39 @@ def prepare_vrsbench_dataset(
             else:
                 raise ValueError(f"Unknown split: {split}. Use 'train' or 'validation'")
         
-        logger.info(f"Downloading images for {split} split...")
-        
-        # Check if images already exist
+        # Check if images already exist (check both extracted images and zip file)
         zip_name = os.path.basename(images_url)
         zip_path = os.path.join(images_dir, zip_name)
         
-        # Check if images are already extracted
+        # First check if images are already extracted
         actual_images_dir = _detect_image_directory(images_dir)
-        has_images = False
+        has_extracted_images = False
         if os.path.exists(actual_images_dir):
-            image_files = [f for f in os.listdir(actual_images_dir) 
-                          if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-            has_images = len(image_files) > 0
+            try:
+                image_files = [f for f in os.listdir(actual_images_dir) 
+                              if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                has_extracted_images = len(image_files) > 0
+            except (OSError, PermissionError):
+                has_extracted_images = False
         
-        if not force_download and has_images:
+        # Check if zip file exists and is valid
+        has_zip = os.path.exists(zip_path) and os.path.getsize(zip_path) > 1024 * 1024  # At least 1MB
+        
+        if not force_download and has_extracted_images:
             logger.info(f"Images already exist in {actual_images_dir}, skipping download")
             images_dir = actual_images_dir
+        elif not force_download and has_zip:
+            # Zip exists but images not extracted - just extract
+            logger.info(f"Zip file exists, extracting images...")
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(images_dir)
+            actual_images_dir = _detect_image_directory(images_dir)
+            if actual_images_dir != images_dir:
+                logger.info(f"Images found in subdirectory: {actual_images_dir}")
+                images_dir = actual_images_dir
         else:
-            # Download zip file
+            # Need to download
+            logger.info(f"Downloading images for {split} split...")
             download_mgr.download_with_retries(images_url, zip_path, force=force_download)
             
             # Extract images
@@ -1205,6 +1218,10 @@ def prepare_vrsbench_dataset(
     
     # Save to JSON if requested
     if output_json:
+        # Handle boolean True - generate default filename
+        if output_json is True:
+            output_json = f"vrsbench_{split}_{task}.json"
+        
         logger.info(f"Saving to JSON: {output_json}")
         with open(output_json, 'w') as f:
             json.dump(test_data, f, indent=2)
@@ -1222,7 +1239,7 @@ def prepare_vrsbench_dataset_parallel(
     hf_token: Optional[str] = None,
     download_images: bool = True,
     images_url: Optional[str] = None,
-    output_json: Optional[str] = None,
+    output_json: Union[Optional[str], bool] = None,
     config: Optional[VRSBenchConfig] = None,
     force_download: bool = False,
     num_workers: int = 8
@@ -1310,7 +1327,7 @@ def prepare_vrsbench_dataset_parallel(
     
     os.makedirs(images_dir, exist_ok=True)
     
-    # Download images if needed (same logic as original)
+    # Download images if needed (improved logic to prevent multiple downloads)
     if download_images:
         # Auto-detect image URL based on split
         if images_url is None:
@@ -1321,25 +1338,39 @@ def prepare_vrsbench_dataset_parallel(
             else:
                 raise ValueError(f"Unknown split: {split}. Use 'train' or 'validation'")
         
-        logger.info(f"Downloading images for {split} split...")
-        
-        # Check if images already exist
+        # Check if images already exist (check both extracted images and zip file)
         zip_name = os.path.basename(images_url)
         zip_path = os.path.join(images_dir, zip_name)
         
-        # Check if images are already extracted
+        # First check if images are already extracted
         actual_images_dir = _detect_image_directory(images_dir)
-        has_images = False
+        has_extracted_images = False
         if os.path.exists(actual_images_dir):
-            image_files = [f for f in os.listdir(actual_images_dir) 
-                          if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-            has_images = len(image_files) > 0
+            try:
+                image_files = [f for f in os.listdir(actual_images_dir) 
+                              if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                has_extracted_images = len(image_files) > 0
+            except (OSError, PermissionError):
+                has_extracted_images = False
         
-        if not force_download and has_images:
+        # Check if zip file exists and is valid
+        has_zip = os.path.exists(zip_path) and os.path.getsize(zip_path) > 1024 * 1024  # At least 1MB
+        
+        if not force_download and has_extracted_images:
             logger.info(f"Images already exist in {actual_images_dir}, skipping download")
             images_dir = actual_images_dir
+        elif not force_download and has_zip:
+            # Zip exists but images not extracted - just extract
+            logger.info(f"Zip file exists, extracting images...")
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(images_dir)
+            actual_images_dir = _detect_image_directory(images_dir)
+            if actual_images_dir != images_dir:
+                logger.info(f"Images found in subdirectory: {actual_images_dir}")
+                images_dir = actual_images_dir
         else:
-            # Download zip file
+            # Need to download
+            logger.info(f"Downloading images for {split} split...")
             download_mgr.download_with_retries(images_url, zip_path, force=force_download)
             
             # Extract images
@@ -1379,16 +1410,17 @@ def prepare_vrsbench_dataset_parallel(
     
     logger.info(f"Found {len(local_image_files)} local image files")
     
-    # KEY CHANGE: Load non-streaming dataset (loads full dataset into memory)
-    logger.info(f"Loading HuggingFace dataset (non-streaming mode): {hf_dataset_name}")
+    # KEY CHANGE: Use streaming mode to avoid HF dataset generation issues
+    # Then collect samples in batches for parallel processing
+    logger.info(f"Loading HuggingFace dataset (streaming mode + parallel processing): {hf_dataset_name}")
     
     # Set up authentication if token provided
     if hf_token:
         os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
     
     try:
-        # Non-streaming mode - loads full dataset for parallel processing
-        hf_dataset = load_dataset(hf_dataset_name, streaming=False)
+        # Use streaming mode to avoid HF dataset generation errors
+        hf_dataset = load_dataset(hf_dataset_name, streaming=True)
     except Exception as e:
         logger.error(f"Failed to load HuggingFace dataset: {e}")
         raise
@@ -1396,18 +1428,22 @@ def prepare_vrsbench_dataset_parallel(
     if split not in hf_dataset:
         raise ValueError(f"Split '{split}' not found in dataset. Available: {list(hf_dataset.keys())}")
     
-    # Convert to list for parallel processing
-    dataset_split = hf_dataset[split]
-    logger.info(f"Converting dataset to list for parallel processing...")
+    # Collect samples from streaming dataset for parallel processing
+    dataset_iterator = hf_dataset[split]
+    logger.info(f"Collecting samples from streaming dataset for parallel processing...")
     all_samples = []
-    for sample in tqdm(dataset_split, desc="Loading dataset", disable=config.LOG_LEVEL == "ERROR"):
-        all_samples.append(sample)
     
-    # Limit samples if requested
-    if num_samples:
-        all_samples = all_samples[:num_samples]
+    # Collect samples with progress bar
+    pbar_collect = tqdm(desc="Collecting samples", disable=config.LOG_LEVEL == "ERROR")
+    for idx, sample in enumerate(dataset_iterator):
+        if num_samples and len(all_samples) >= num_samples:
+            break
+        all_samples.append((idx, sample))
+        pbar_collect.update(1)
+        pbar_collect.set_postfix({"collected": len(all_samples)})
+    pbar_collect.close()
     
-    logger.info(f"Loaded {len(all_samples)} samples, processing in parallel with {num_workers} workers...")
+    logger.info(f"Collected {len(all_samples)} samples, processing in parallel with {num_workers} workers...")
     
     # Initialize task-specific mappings
     test_data = {
@@ -1570,8 +1606,8 @@ def prepare_vrsbench_dataset_parallel(
             # Log error but don't fail entire batch
             return None
     
-    # Prepare arguments for parallel processing
-    args_list = [(idx, sample) for idx, sample in enumerate(all_samples)]
+    # Prepare arguments for parallel processing (already have idx from collection)
+    args_list = all_samples  # Already in (idx, sample) format
     
     # Process in parallel using ThreadPoolExecutor
     logger.info(f"Starting parallel processing with {num_workers} workers...")
@@ -1581,12 +1617,12 @@ def prepare_vrsbench_dataset_parallel(
     pbar = tqdm(total=len(args_list), desc=f"Processing samples ({task})", disable=config.LOG_LEVEL == "ERROR")
     
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Submit all tasks
-        future_to_idx = {executor.submit(process_single_sample, args): idx for idx, args in enumerate(args_list)}
+        # Submit all tasks (args_list already contains (idx, sample) tuples)
+        future_to_args = {executor.submit(process_single_sample, args): args for args in args_list}
         
         # Collect results as they complete
         completed = 0
-        for future in as_completed(future_to_idx):
+        for future in as_completed(future_to_args):
             completed += 1
             result = future.result()
             
@@ -1638,6 +1674,10 @@ def prepare_vrsbench_dataset_parallel(
     
     # Save to JSON if requested
     if output_json:
+        # Handle boolean True - generate default filename
+        if output_json is True:
+            output_json = f"vrsbench_{split}_{task}.json"
+        
         logger.info(f"Saving to JSON: {output_json}")
         with open(output_json, 'w') as f:
             json.dump(test_data, f, indent=2)
