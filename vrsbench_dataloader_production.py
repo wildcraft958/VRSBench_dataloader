@@ -760,9 +760,34 @@ def save_to_parquet(data: Dict[str, Any], output_path: str, logger: Optional['St
     
     try:
         import pandas as pd
+        import json
         
-        # Convert samples to DataFrame
-        df_samples = pd.DataFrame(data["samples"])
+        # Convert samples to DataFrame, converting complex types to strings
+        samples = data["samples"]
+        samples_processed = []
+        for sample in samples:
+            sample_processed = {}
+            for key, value in sample.items():
+                # Handle None values
+                if value is None:
+                    sample_processed[key] = None
+                # Convert complex types (list, dict, tuple) to JSON strings
+                elif isinstance(value, (list, dict, tuple)):
+                    sample_processed[key] = json.dumps(value)
+                else:
+                    # Convert all other types to strings
+                    sample_processed[key] = str(value)
+            samples_processed.append(sample_processed)
+        
+        # Convert to DataFrame
+        df_samples = pd.DataFrame(samples_processed)
+        
+        # Convert all columns to string type to avoid type inference issues
+        # Replace None with empty string to avoid "None" string issues
+        for col in df_samples.columns:
+            df_samples[col] = df_samples[col].astype(str)
+            # Replace "None" string (from None values) with empty string
+            df_samples[col] = df_samples[col].replace('None', '')
         
         # Save samples to parquet
         df_samples.to_parquet(output_path, compression='snappy', index=False)
@@ -815,10 +840,33 @@ def load_from_parquet(parquet_path: str, logger: Optional['StructuredLogger'] = 
     
     try:
         import pandas as pd
+        import json
         
         # Load samples from parquet
         df_samples = pd.read_parquet(parquet_path)
-        samples = df_samples.to_dict('records')
+        
+        # Convert back from strings to original types
+        samples = []
+        for _, row in df_samples.iterrows():
+            sample = {}
+            for key, value in row.items():
+                # Handle empty strings (were None originally)
+                if pd.isna(value) or (isinstance(value, str) and value == ''):
+                    sample[key] = None
+                # Try to parse JSON strings back to complex types
+                elif isinstance(value, str):
+                    # Check if it's a JSON string (starts with [ or {)
+                    if value.strip().startswith(('{', '[')):
+                        try:
+                            sample[key] = json.loads(value)
+                        except (json.JSONDecodeError, ValueError):
+                            # If parsing fails, keep as string
+                            sample[key] = value
+                    else:
+                        sample[key] = value
+                else:
+                    sample[key] = value
+            samples.append(sample)
         
         # Load metadata
         metadata_path = parquet_path.replace('.parquet', '_metadata.json')
