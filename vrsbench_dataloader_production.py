@@ -126,6 +126,11 @@ class VRSBenchConfig:
     # HuggingFace streaming fault tolerance
     HF_MAX_CONSECUTIVE_PARSE_ERRORS: int = 5
 
+    # Data sourcing preferences
+    PREFER_LOCAL_ANNOTATIONS: bool = os.getenv(
+        "VRSBENCH_PREFER_LOCAL_ANNOTATIONS", "1"
+    ).strip().lower() not in {"0", "false", "no"}
+
     # Task-specific settings
     SUPPORTED_TASKS: List[str] = None  # Will be set in __post_init__
 
@@ -372,12 +377,13 @@ class ProgressCheckpointWriter:
         if self.enabled:
             os.makedirs(self.checkpoint_dir, exist_ok=True)
 
-    def maybe_checkpoint(self, data: Dict[str, Any], processed_count: int):
+    def maybe_checkpoint(self, data: Dict[str, Any], processed_count: int) -> bool:
         if not self.enabled or processed_count - self.last_checkpoint_count < self.every:
-            return
+            return False
         file_name = f"{self.prefix}_progress_{processed_count:06d}.json"
         self._write_snapshot(data, file_name)
         self.last_checkpoint_count = processed_count
+        return True
 
     def finalize(self, data: Dict[str, Any]):
         if not self.enabled:
@@ -547,8 +553,42 @@ def _resilient_sample_generator(
     annotations_url: Optional[str],
     force_download: bool = False,
     stats: Optional[Dict[str, int]] = None,
+    prefer_local_annotations: Optional[bool] = None,
 ) -> Iterator[Dict[str, Any]]:
     """Yield samples from HuggingFace streaming dataset with automatic fallback."""
+    prefer_local = (
+        config.PREFER_LOCAL_ANNOTATIONS if prefer_local_annotations is None else prefer_local_annotations
+    )
+    fallback_zip_path: Optional[str] = None
+
+    def _local_iterator(reason: str) -> Optional[Iterator[Dict[str, Any]]]:
+        nonlocal fallback_zip_path
+        fallback_zip_path = fallback_zip_path or _ensure_annotations_zip(
+            split=split,
+            annotations_dir=annotations_dir,
+            annotations_url=annotations_url,
+            config=config,
+            download_mgr=download_mgr,
+            logger=logger,
+            force_download=force_download,
+        )
+        if fallback_zip_path:
+            logger.info(reason)
+            return _iterate_annotations_from_zip(fallback_zip_path, logger, stats=stats)
+        return None
+
+    if prefer_local:
+        local_iter = _local_iterator(
+            "Preferring local annotations zip before falling back to HuggingFace streaming"
+        )
+        if local_iter is not None:
+            yield from local_iter
+            return
+        else:
+            logger.warning(
+                "Prefer-local requested but annotations zip unavailable; attempting HuggingFace streaming"
+            )
+
     hf_iterator: Optional[Iterator[Dict[str, Any]]] = None
     if HAS_DATASETS:
         if hf_token:
@@ -602,18 +642,9 @@ def _resilient_sample_generator(
                 continue
 
     if hf_iterator is None or fallback_triggered:
-        zip_path = _ensure_annotations_zip(
-            split=split,
-            annotations_dir=annotations_dir,
-            annotations_url=annotations_url,
-            config=config,
-            download_mgr=download_mgr,
-            logger=logger,
-            force_download=force_download,
-        )
-        if zip_path:
-            logger.info("Using local annotations fallback loader")
-            for sample in _iterate_annotations_from_zip(zip_path, logger, stats=stats):
+        local_iter = _local_iterator("Using local annotations fallback loader")
+        if local_iter is not None:
+            for sample in local_iter:
                 yield sample
 
 # ========================= Download Utilities =========================
@@ -1335,7 +1366,10 @@ def prepare_vrsbench_dataset(
     images_url: Optional[str] = None,
     output_json: Union[Optional[str], bool] = None,
     config: Optional[VRSBenchConfig] = None,
-    force_download: bool = False
+    force_download: bool = False,
+    prefer_local_annotations: Optional[bool] = None,
+    annotations_dir: Optional[str] = None,
+    annotations_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     High-level function to prepare VRSBench dataset for any task.
@@ -1368,7 +1402,10 @@ def prepare_vrsbench_dataset(
     images_url: Custom URL for images (default: auto-detect from split)
         output_json: Path to save JSON mapping (optional)
         config: Configuration object (optional)
-        force_download: Force re-download even if images exist
+    force_download: Force re-download even if images exist
+    prefer_local_annotations: Force local annotations to be the primary source (default: config flag)
+    annotations_dir: Directory to cache annotations zip used by the fallback loader
+    annotations_url: Custom URL for annotations zip (default: auto-detect from split)
     
         Returns:
                 Dictionary with:
@@ -1399,6 +1436,9 @@ def prepare_vrsbench_dataset(
         >>> # Access all mappings: image_to_caption, image_to_label, image_to_qa_pairs, image_to_bboxes
     """
     config = config or VRSBenchConfig()
+    prefer_local_annotations = (
+        config.PREFER_LOCAL_ANNOTATIONS if prefer_local_annotations is None else prefer_local_annotations
+    )
     
     # Handle "all" tasks mode
     load_all_tasks = (task is None or task == "all")
@@ -1485,7 +1525,9 @@ def prepare_vrsbench_dataset(
                 images_dir = actual_images_dir
     
     # Prepare resilient sample generator (HF streaming + fallback)
-    logger.info(f"Combining streaming dataset with local images...")
+    logger.info(
+        f"Combining annotations (prefer_local={prefer_local_annotations}) with local images..."
+    )
     if num_samples:
         logger.info(f"Extracting {num_samples} samples from {split} set...")
     else:
@@ -1499,10 +1541,11 @@ def prepare_vrsbench_dataset(
         logger=logger,
         config=config,
         download_mgr=download_mgr,
-        annotations_dir=None,
-        annotations_url=None,
+        annotations_dir=annotations_dir,
+        annotations_url=annotations_url,
         force_download=force_download,
         stats=sample_stats,
+        prefer_local_annotations=prefer_local_annotations,
     )
     
     # Initialize task-specific mappings
@@ -1982,6 +2025,7 @@ def prepare_vrsbench_dataset_parallel(
     force_download: bool = False,
     num_workers: Optional[int] = None,
     use_multiprocessing: bool = True,
+    prefer_local_annotations: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     High-level parallel function to prepare VRSBench dataset for any task.
@@ -2016,7 +2060,7 @@ def prepare_vrsbench_dataset_parallel(
         hf_token: HuggingFace token (or use HUGGINGFACE_HUB_TOKEN env var)
         download_images: Whether to download images (default: True)
         images_url: Custom URL for images (default: auto-detect from split)
-        annotations_dir: Directory to cache annotations zip used by the fallback loader
+    annotations_dir: Directory to cache annotations zip used by the fallback loader
         annotations_url: Custom URL for annotations zip (default: auto-detect from split)
         output_json: Path to save JSON mapping (optional, or True for auto-filename)
         output_parquet: Path to save parquet file (optional, 10-100x faster than JSON)
@@ -2027,6 +2071,7 @@ def prepare_vrsbench_dataset_parallel(
         num_workers: Number of parallel workers (default: min(32, os.cpu_count()) for multiprocessing, min(8, os.cpu_count() * 2) for threading)
         use_multiprocessing: Use ProcessPoolExecutor for true parallelism (default: True)
                              Set False to use ThreadPoolExecutor (I/O-bound only)
+    prefer_local_annotations: Force local annotations to be the primary source (default: config flag)
     
     Returns:
         Dictionary with:
@@ -2063,6 +2108,9 @@ def prepare_vrsbench_dataset_parallel(
         )
     
     config = config or VRSBenchConfig()
+    prefer_local_annotations = (
+        config.PREFER_LOCAL_ANNOTATIONS if prefer_local_annotations is None else prefer_local_annotations
+    )
     
     # Handle "all" tasks mode
     load_all_tasks = (task is None or task == "all")
@@ -2185,7 +2233,18 @@ def prepare_vrsbench_dataset_parallel(
 
     # Resilient sample generator with automatic fallback to local annotations
     logger.info(
-        f"Collecting samples using resilient loader (primary: {hf_dataset_name}, fallback: local annotations)"
+        f"Collecting samples using resilient loader (primary: {hf_dataset_name}, fallback: local annotations, prefer_local={prefer_local_annotations})"
+    )
+    effective_checkpoint_every = (
+        checkpoint_every if checkpoint_every is not None else config.CHECKPOINT_EVERY_SAMPLES
+    )
+    collection_checkpoint_writer = ProgressCheckpointWriter(
+        enabled=bool(effective_checkpoint_every and effective_checkpoint_every > 0),
+        checkpoint_dir=checkpoint_dir or config.CHECKPOINT_DIR,
+        split=split,
+        task=f"{task}_collection",
+        every=effective_checkpoint_every or 0,
+        logger=logger,
     )
     sample_stats: Dict[str, int] = {}
     sample_iterator = _resilient_sample_generator(
@@ -2199,6 +2258,7 @@ def prepare_vrsbench_dataset_parallel(
         annotations_url=annotations_url,
         force_download=force_download,
         stats=sample_stats,
+        prefer_local_annotations=prefer_local_annotations,
     )
 
     all_samples: List[Tuple[int, Dict[str, Any]]] = []
@@ -2206,6 +2266,8 @@ def prepare_vrsbench_dataset_parallel(
     duplicates_skipped = 0
     pbar_collect = tqdm(desc="Collecting samples", disable=config.LOG_LEVEL == "ERROR")
     idx = 0
+    collection_buffer: List[Dict[str, Any]] = []
+    collection_chunk_start = 0
 
     try:
         for sample in sample_iterator:
@@ -2223,11 +2285,31 @@ def prepare_vrsbench_dataset_parallel(
 
             sample_keys_seen.add(sample_key)
             all_samples.append((idx, sample))
+            collection_buffer.append({
+                "dataset_index": idx,
+                "sample": sample,
+            })
             pbar_collect.update(1)
             pbar_collect.set_postfix({
                 "collected": len(all_samples),
                 "skipped": duplicates_skipped + sample_stats.get("hf_parsing_errors", 0)
             })
+            if collection_checkpoint_writer.maybe_checkpoint(
+                {
+                    "stage": "collecting_samples",
+                    "split": split,
+                    "task": task,
+                    "chunk_start_index": collection_chunk_start,
+                    "chunk_size": len(collection_buffer),
+                    "total_collected": len(all_samples),
+                    "duplicates_skipped": duplicates_skipped,
+                    "stats": sample_stats,
+                    "samples": collection_buffer,
+                },
+                len(all_samples),
+            ):
+                collection_chunk_start = len(all_samples)
+                collection_buffer = []
             idx += 1
     except KeyboardInterrupt:
         logger.warning("Sample collection interrupted by user")
@@ -2237,6 +2319,18 @@ def prepare_vrsbench_dataset_parallel(
         raise
     finally:
         pbar_collect.close()
+
+    collection_checkpoint_writer.finalize({
+        "stage": "collecting_samples",
+        "split": split,
+        "task": task,
+        "chunk_start_index": collection_chunk_start,
+        "chunk_size": len(collection_buffer),
+        "total_collected": len(all_samples),
+        "duplicates_skipped": duplicates_skipped,
+        "stats": sample_stats,
+        "samples": collection_buffer,
+    })
 
     skipped_parsing = (
         sample_stats.get("hf_parsing_errors", 0)
@@ -2291,9 +2385,6 @@ def prepare_vrsbench_dataset_parallel(
         test_data["image_to_bboxes"] = {}
     
     # Checkpoint writer for incremental persistence
-    effective_checkpoint_every = (
-        checkpoint_every if checkpoint_every is not None else config.CHECKPOINT_EVERY_SAMPLES
-    )
     checkpoint_writer = ProgressCheckpointWriter(
         enabled=bool(effective_checkpoint_every and effective_checkpoint_every > 0),
         checkpoint_dir=checkpoint_dir or config.CHECKPOINT_DIR,

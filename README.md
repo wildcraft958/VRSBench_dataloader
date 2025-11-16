@@ -48,6 +48,8 @@ This loader eliminates all of that. **One function call replaces 50+ lines of bo
 
 **Incremental Checkpoints**: Long-running extractions now save JSON snapshots every `config.CHECKPOINT_EVERY_SAMPLES` (and on completion) into `config.CHECKPOINT_DIR`, and the parallel path exposes `checkpoint_dir`/`checkpoint_every` knobs. If a run is interrupted you can resume from the latest snapshot instead of starting from zero.
 
+**Local-First Annotation Mode**: Set `VRSBENCH_PREFER_LOCAL_ANNOTATIONS=1` (default) or pass `prefer_local_annotations=True` to both preparation APIs to skip HuggingFace streaming entirely whenever the annotation zips are cached. This avoids remote throttling, makes throughput hardware-bound, and still falls back to streaming if the local files are missing.
+
 ## Installation
 
 ```bash
@@ -432,7 +434,12 @@ parallel_data = prepare_vrsbench_dataset_parallel(
 )
 ```
 
-When a run restarts it automatically continues collecting new samples; you can also load the latest checkpoint JSON manually if you need to inspect progress.
+You'll now see **two families of checkpoint files**:
+
+- `*_collection_progress_XXXXX.json` – raw sample chunks emitted during the collection phase. Each snapshot contains `dataset_index` + `sample` payloads plus summary stats so you keep the streaming work you've already paid for.
+- `*_progress_XXXXX.json` – processed samples produced by the parallel workers, identical to previous releases.
+
+Both streams honor the same `checkpoint_every` cadence, so you start seeing durable files within the first few thousand samples even if processing hasn't begun yet. When a run restarts it automatically keeps collecting, and you can manually reload the most recent checkpoint JSON if you want to inspect or replay the captured chunk.
 
 ### Controlling the Annotation Fallback
 
@@ -449,6 +456,13 @@ data = prepare_vrsbench_dataset_parallel(
 ```
 
 The helper automatically downloads the zip (with retries), caches it under `annotations_dir`, and iterates the JSON payload while normalizing known schema quirks (e.g., mixed `ques_id` types).
+
+To **make local annotations the primary source** (skipping streaming entirely unless the zip is missing), either:
+
+- Set `VRSBENCH_PREFER_LOCAL_ANNOTATIONS=1` (default), or
+- Pass `prefer_local_annotations=True` into `prepare_vrsbench_dataset()` / `prepare_vrsbench_dataset_parallel()`.
+
+Set the flag to `False` if you explicitly want to prioritize HuggingFace streaming even when cached zips are present.
 
 ### Custom Image Transforms
 
@@ -886,7 +900,9 @@ MIT License
 - 🔁 **Duplicate & Error Tracking** – Deterministic sample keys prevent duplicated metadata and surface precise skip counts for transparency.
 - 💾 **Incremental Checkpointing** – Streaming and parallel flows now write periodic JSON snapshots (configurable via `CHECKPOINT_EVERY_SAMPLES` or per-call overrides) and always finalize a checkpoint on exit.
 - ⚙️ **Configurable Fallback Paths** – Parallel API exposes `annotations_dir` / `annotations_url` controls for air-gapped or custom annotation sources.
-- 📘 **Documentation Updates** – README sections covering checkpointing, fallback controls, and API docstrings describing the new parameters.
+- � **Collection Checkpoints** – `_collection_progress_*.json` snapshots capture raw generator chunks instantly so even pre-processing work is durable.
+- 🏠 **Local-First Option** – Set `VRSBENCH_PREFER_LOCAL_ANNOTATIONS` or `prefer_local_annotations=True` to prioritize cached annotations and avoid slow HF streaming (still falls back automatically when the zip is missing).
+- �📘 **Documentation Updates** – README sections covering checkpointing, fallback controls, and API docstrings describing the new parameters.
 
 ### Version 3.2.0 (2025-01-15) - Image Matching Fix & Complete Task Mode
 - 🐛 **Fixed Image Matching Bug** - Now properly extracts image IDs from dataset's `'image'` field (PIL Image objects, string paths, or dict formats)
