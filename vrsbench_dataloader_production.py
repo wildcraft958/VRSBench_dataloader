@@ -767,6 +767,11 @@ class DownloadManager:
         """
         start_time = time.time()
 
+        # Ensure output directory exists before attempting to write
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
         # Check cache first - avoids re-downloading if file already exists
         if not force and os.path.exists(output_path):
             if self.config.VERIFY_CACHE and self._verify_file(output_path):
@@ -782,7 +787,10 @@ class DownloadManager:
             else:
                 # Cached file exists but failed verification - delete and re-download
                 self.logger.warning(f"Cached file invalid, re-downloading: {output_path}")
-                os.remove(output_path)
+                try:
+                    os.remove(output_path)
+                except OSError as e:
+                    self.logger.error(f"Failed to remove invalid cached file: {e}")
 
         # Cache miss - need to download
         self.metrics.increment("cache_misses")
