@@ -504,6 +504,8 @@ def _iterate_annotations_from_zip(
                 if not json_files:
                     logger.warning(f"No JSON files found inside {zip_path}")
                 for member in json_files:
+                    if "__MACOSX/" in member or os.path.basename(member).startswith("._"):
+                        continue
                     try:
                         with zf.open(member, "r") as fh:
                             text = io.TextIOWrapper(fh, encoding="utf-8")
@@ -2205,8 +2207,14 @@ def prepare_vrsbench_dataset_parallel(
                 logger.info(f"Images found in subdirectory: {actual_images_dir}")
                 images_dir = actual_images_dir
     
+    # Always run image directory detection, even if not downloading
+    actual_images_dir = _detect_image_directory(images_dir)
+    if actual_images_dir != images_dir:
+        logger.info(f"Adjusting images_dir to detected subdirectory: {actual_images_dir}")
+        images_dir = actual_images_dir
+
     # Build local image files index (same as original)
-    logger.info(f"Building image file index...")
+    logger.info(f"Building image file index from: {images_dir}")
     local_image_files = {}
     if os.path.exists(images_dir):
         # Collect all image files first for progress tracking
